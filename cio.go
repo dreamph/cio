@@ -10,6 +10,7 @@ import (
 	"fmt"
 	"io"
 	"mime/multipart"
+	"net"
 	"net/http"
 	"net/http/cookiejar"
 	"net/url"
@@ -74,11 +75,16 @@ const (
 	OTF   = "font/otf"
 )
 
+// Buffer sizes
+const (
+	defaultBufferSize = 32 * 1024 // 32KB - optimal for most transfers
+)
+
 // Buffer pools for reducing allocations
 var (
 	bufferPool = sync.Pool{
 		New: func() any {
-			return bytes.NewBuffer(make([]byte, 0, 4096))
+			return bytes.NewBuffer(make([]byte, 0, defaultBufferSize))
 		},
 	}
 	requestPool = sync.Pool{
@@ -87,6 +93,11 @@ var (
 				headers: make(map[string]string, 8),
 				query:   make(map[string]string, 4),
 			}
+		},
+	}
+	copyBufPool = sync.Pool{
+		New: func() any {
+			return make([]byte, defaultBufferSize)
 		},
 	}
 )
@@ -98,14 +109,14 @@ func getBuffer() *bytes.Buffer {
 }
 
 func putBuffer(buf *bytes.Buffer) {
-	if buf.Cap() <= 64*1024 { // Don't pool large buffers
+	// avoid pooling huge buffers if any code grows it unexpectedly
+	if buf.Cap() <= 64*1024 {
 		bufferPool.Put(buf)
 	}
 }
 
 func getRequest() *request {
 	r := requestPool.Get().(*request)
-	// Reset fields
 	r.body = nil
 	r.bodyBytes = nil
 	r.output = nil
@@ -115,7 +126,6 @@ func getRequest() *request {
 	r.retryBackoff = 0
 	r.retryWhen = nil
 	r.expectStatus = r.expectStatus[:0]
-	// Clear maps
 	for k := range r.headers {
 		delete(r.headers, k)
 	}
@@ -125,8 +135,18 @@ func getRequest() *request {
 	return r
 }
 
-func putRequest(r *request) {
-	requestPool.Put(r)
+func putRequest(r *request) { requestPool.Put(r) }
+
+func getCopyBuf() []byte { return copyBufPool.Get().([]byte) }
+
+func putCopyBuf(b []byte) {
+	// normalize back to default size to keep pool consistent
+	if cap(b) >= defaultBufferSize {
+		copyBufPool.Put(b[:defaultBufferSize])
+		return
+	}
+	// if it's smaller for some reason, still put it back
+	copyBufPool.Put(b)
 }
 
 // Errors
@@ -180,6 +200,9 @@ func OnResponse(fn ResponseInterceptor) ClientOption {
 // WithCookieJar enables cookie management
 func WithCookieJar() ClientOption {
 	return func(c *Client) {
+		if c.http == nil {
+			c.http = &http.Client{Transport: DefaultTransport()}
+		}
 		jar, _ := cookiejar.New(nil)
 		c.http.Jar = jar
 	}
@@ -188,6 +211,9 @@ func WithCookieJar() ClientOption {
 // WithRedirects sets max redirects (0 = disable redirects)
 func WithRedirects(max int) ClientOption {
 	return func(c *Client) {
+		if c.http == nil {
+			c.http = &http.Client{Transport: DefaultTransport()}
+		}
 		c.http.CheckRedirect = func(req *http.Request, via []*http.Request) error {
 			if max == 0 {
 				return http.ErrUseLastResponse
@@ -201,9 +227,7 @@ func WithRedirects(max int) ClientOption {
 }
 
 // NoRedirects disables following redirects
-func NoRedirects() ClientOption {
-	return WithRedirects(0)
-}
+func NoRedirects() ClientOption { return WithRedirects(0) }
 
 // WithRequestID sets a function to generate request IDs (added as X-Request-ID header)
 func WithRequestID(fn func() string) ClientOption {
@@ -217,7 +241,10 @@ func WithTracing(serviceName string) ClientOption {
 	return func(c *Client) {
 		c.requestID = func() string {
 			b := make([]byte, 16)
-			rand.Read(b)
+			if _, err := rand.Read(b); err != nil {
+				// fallback: time-based (still unique enough for most use)
+				return fmt.Sprintf("%d", time.Now().UnixNano())
+			}
 			return hex.EncodeToString(b)
 		}
 		c.onRequest = append(c.onRequest, func(req *http.Request) {
@@ -229,12 +256,21 @@ func WithTracing(serviceName string) ClientOption {
 // DefaultTransport returns an optimized http.Transport for high performance
 func DefaultTransport() *http.Transport {
 	return &http.Transport{
-		MaxIdleConns:        100,
-		MaxIdleConnsPerHost: 100,
-		MaxConnsPerHost:     100,
-		IdleConnTimeout:     90 * time.Second,
-		DisableCompression:  false,
-		ForceAttemptHTTP2:   true,
+		Proxy: http.ProxyFromEnvironment,
+		DialContext: (&net.Dialer{
+			Timeout:   30 * time.Second,
+			KeepAlive: 30 * time.Second,
+		}).DialContext,
+		MaxIdleConns:          100,
+		MaxIdleConnsPerHost:   100,
+		MaxConnsPerHost:       100,
+		IdleConnTimeout:       90 * time.Second,
+		TLSHandshakeTimeout:   10 * time.Second,
+		ExpectContinueTimeout: 1 * time.Second,
+		DisableCompression:    false,
+		ForceAttemptHTTP2:     true,
+		ReadBufferSize:        defaultBufferSize,
+		WriteBufferSize:       defaultBufferSize,
 	}
 }
 
@@ -247,12 +283,15 @@ func New(opts ...ClientOption) *Client {
 	for _, opt := range opts {
 		opt(c)
 	}
+	if c.http == nil {
+		c.http = &http.Client{Transport: DefaultTransport()}
+	}
 	return c
 }
 
 // SetCookies sets cookies for a URL
 func (c *Client) SetCookies(rawURL string, cookies []*http.Cookie) error {
-	if c.http.Jar == nil {
+	if c.http == nil || c.http.Jar == nil {
 		return ErrNoCookieJar
 	}
 	u, err := url.Parse(rawURL)
@@ -265,7 +304,7 @@ func (c *Client) SetCookies(rawURL string, cookies []*http.Cookie) error {
 
 // Cookies returns cookies for a URL
 func (c *Client) Cookies(rawURL string) ([]*http.Cookie, error) {
-	if c.http.Jar == nil {
+	if c.http == nil || c.http.Jar == nil {
 		return nil, ErrNoCookieJar
 	}
 	u, err := url.Parse(rawURL)
@@ -283,22 +322,21 @@ type Response struct {
 	Written    int64 // bytes written when using OutputStream
 }
 
-func (r *Response) OK() bool {
-	return r.StatusCode >= 200 && r.StatusCode < 300
-}
+func (r *Response) OK() bool { return r.StatusCode >= 200 && r.StatusCode < 300 }
 
 func (r *Response) String() string {
+	if r.Body == nil {
+		return ""
+	}
 	return string(r.Body)
 }
 
-func (r *Response) Json(v any) error {
-	return json.Unmarshal(r.Body, v)
-}
+func (r *Response) Json(v any) error { return json.Unmarshal(r.Body, v) }
 
 // Json helper with generics
 func Json[T any](r *Response) (T, error) {
 	var v T
-	err := r.Json(&v)
+	err := json.Unmarshal(r.Body, &v)
 	return v, err
 }
 
@@ -307,11 +345,17 @@ type File struct {
 	Name   string    // form field name
 	Path   string    // filename in the form
 	Reader io.Reader // file content
+	Size   int64     // optional: if known (not used for multipart Content-Length by default)
 }
 
 // NewFile creates a File from reader
 func NewFile(fieldName, fileName string, r io.Reader) File {
 	return File{Name: fieldName, Path: fileName, Reader: r}
+}
+
+// NewFileWithSize creates a File with known size
+func NewFileWithSize(fieldName, fileName string, r io.Reader, size int64) File {
+	return File{Name: fieldName, Path: fileName, Reader: r, Size: size}
 }
 
 // Multipart represents multipart form data
@@ -320,9 +364,7 @@ type Multipart struct {
 	Fields map[string]string
 }
 
-func (m Multipart) apply(r *request) {
-	r.multipart = &m
-}
+func (m Multipart) apply(r *request) { r.multipart = &m }
 
 // R - Request config struct (also implements Option)
 type R struct {
@@ -344,8 +386,9 @@ func (cfg R) apply(r *request) {
 	}
 	if cfg.Body != nil {
 		buf := getBuffer()
-		json.NewEncoder(buf).Encode(cfg.Body)
-		// Remove trailing newline from Encode
+		enc := json.NewEncoder(buf)
+		enc.SetEscapeHTML(false)
+		_ = enc.Encode(cfg.Body)
 		b := buf.Bytes()
 		if len(b) > 0 && b[len(b)-1] == '\n' {
 			b = b[:len(b)-1]
@@ -368,7 +411,7 @@ func (f optionFunc) apply(r *request) { f(r) }
 
 type request struct {
 	body         io.Reader
-	bodyBytes    []byte // for retry (need to re-read body)
+	bodyBytes    []byte
 	output       io.Writer
 	headers      map[string]string
 	query        map[string]string
@@ -383,8 +426,9 @@ type request struct {
 func Body(v any) Option {
 	return optionFunc(func(r *request) {
 		buf := getBuffer()
-		json.NewEncoder(buf).Encode(v)
-		// Remove trailing newline from Encode
+		enc := json.NewEncoder(buf)
+		enc.SetEscapeHTML(false)
+		_ = enc.Encode(v)
 		b := buf.Bytes()
 		if len(b) > 0 && b[len(b)-1] == '\n' {
 			b = b[:len(b)-1]
@@ -396,16 +440,23 @@ func Body(v any) Option {
 	})
 }
 
+// BodyBytes sets pre-encoded body bytes (zero-copy for pre-marshaled data)
+func BodyBytes(data []byte) Option {
+	return optionFunc(func(r *request) {
+		r.bodyBytes = data
+		r.body = bytes.NewReader(data)
+	})
+}
+
 func BodyReader(reader io.Reader) Option {
 	return optionFunc(func(r *request) {
 		r.body = reader
+		r.bodyBytes = nil
 	})
 }
 
 func OutputStream(w io.Writer) Option {
-	return optionFunc(func(r *request) {
-		r.output = w
-	})
+	return optionFunc(func(r *request) { r.output = w })
 }
 
 // Files creates a multipart upload with files only
@@ -447,18 +498,14 @@ func Retry(count, backoffMs int, conditions ...RetryCondition) Option {
 	})
 }
 
-// WhenStatus retries on specific status codes
+// WhenStatus retries on specific status codes (O(1) lookup)
 func WhenStatus(codes ...int) RetryCondition {
-	// Pre-build map for O(1) lookup
 	codeMap := make(map[int]struct{}, len(codes))
 	for _, c := range codes {
 		codeMap[c] = struct{}{}
 	}
 	return func(resp *Response, err error) bool {
-		if err != nil {
-			return true
-		}
-		if resp == nil {
+		if err != nil || resp == nil {
 			return true
 		}
 		_, ok := codeMap[resp.StatusCode]
@@ -469,10 +516,7 @@ func WhenStatus(codes ...int) RetryCondition {
 // When5xx retries on 5xx status codes
 func When5xx() RetryCondition {
 	return func(resp *Response, err error) bool {
-		if err != nil {
-			return true
-		}
-		if resp == nil {
+		if err != nil || resp == nil {
 			return true
 		}
 		return resp.StatusCode >= 500
@@ -482,32 +526,26 @@ func When5xx() RetryCondition {
 // WhenErr retries based on custom error check
 func WhenErr(fn func(err error) bool) RetryCondition {
 	return func(resp *Response, err error) bool {
-		if err != nil {
-			return fn(err)
-		}
-		return false
+		return err != nil && fn(err)
 	}
 }
 
 // When retries based on custom condition
-func When(fn func(resp *Response, err error) bool) RetryCondition {
-	return fn
-}
+func When(fn func(resp *Response, err error) bool) RetryCondition { return fn }
 
 // ExpectStatus sets expected status codes, returns error if not matched
 func ExpectStatus(codes ...int) Option {
 	return optionFunc(func(r *request) {
-		r.expectStatus = codes
+		r.expectStatus = append(r.expectStatus[:0], codes...)
 	})
 }
 
-// Pre-allocated 2xx status codes for ExpectOK
 var okStatusCodes = []int{200, 201, 202, 203, 204, 205, 206, 207, 208, 226}
 
 // ExpectOK expects 2xx status codes
 func ExpectOK() Option {
 	return optionFunc(func(r *request) {
-		r.expectStatus = okStatusCodes
+		r.expectStatus = append(r.expectStatus[:0], okStatusCodes...)
 	})
 }
 
@@ -542,19 +580,12 @@ func Headers(opts ...HeaderOption) Option {
 	})
 }
 
-func ContentType(ct string) HeaderOption {
-	return func(r *request) { r.headers["Content-Type"] = ct }
-}
-
-func Accept(ct string) HeaderOption {
-	return func(r *request) { r.headers["Accept"] = ct }
-}
-
+func ContentType(ct string) HeaderOption { return func(r *request) { r.headers["Content-Type"] = ct } }
+func Accept(ct string) HeaderOption      { return func(r *request) { r.headers["Accept"] = ct } }
 func Header(key, value string) HeaderOption {
 	return func(r *request) { r.headers[key] = value }
 }
 
-// Pre-allocated bearer prefix
 const bearerPrefix = "Bearer "
 
 func Bearer(token string) HeaderOption {
@@ -565,21 +596,73 @@ func Bearer(token string) HeaderOption {
 func (c *Client) Get(ctx context.Context, path string, opts ...Option) (*Response, error) {
 	return c.do(ctx, http.MethodGet, path, opts...)
 }
-
 func (c *Client) Post(ctx context.Context, path string, opts ...Option) (*Response, error) {
 	return c.do(ctx, http.MethodPost, path, opts...)
 }
-
 func (c *Client) Put(ctx context.Context, path string, opts ...Option) (*Response, error) {
 	return c.do(ctx, http.MethodPut, path, opts...)
 }
-
 func (c *Client) Patch(ctx context.Context, path string, opts ...Option) (*Response, error) {
 	return c.do(ctx, http.MethodPatch, path, opts...)
 }
-
 func (c *Client) Delete(ctx context.Context, path string, opts ...Option) (*Response, error) {
 	return c.do(ctx, http.MethodDelete, path, opts...)
+}
+func (c *Client) Head(ctx context.Context, path string, opts ...Option) (*Response, error) {
+	return c.do(ctx, http.MethodHead, path, opts...)
+}
+func (c *Client) Options(ctx context.Context, path string, opts ...Option) (*Response, error) {
+	return c.do(ctx, http.MethodOptions, path, opts...)
+}
+
+// Do executes a custom method request
+func (c *Client) Do(ctx context.Context, method, path string, opts ...Option) (*Response, error) {
+	return c.do(ctx, method, path, opts...)
+}
+
+// ParallelResult holds the result of a parallel request
+type ParallelResult struct {
+	Response *Response
+	Error    error
+	Index    int
+}
+
+// ParallelRequest represents a request for parallel execution
+type ParallelRequest struct {
+	Method string
+	Path   string
+	Opts   []Option
+}
+
+// Parallel executes multiple requests concurrently
+func (c *Client) Parallel(ctx context.Context, requests []ParallelRequest) []ParallelResult {
+	results := make([]ParallelResult, len(requests))
+	var wg sync.WaitGroup
+	wg.Add(len(requests))
+
+	for i, req := range requests {
+		go func(idx int, r ParallelRequest) {
+			defer wg.Done()
+			resp, err := c.do(ctx, r.Method, r.Path, r.Opts...)
+			results[idx] = ParallelResult{Response: resp, Error: err, Index: idx}
+		}(i, req)
+	}
+
+	wg.Wait()
+	return results
+}
+
+// ParallelGet executes multiple GET requests concurrently
+func (c *Client) ParallelGet(ctx context.Context, paths []string, opts ...Option) []ParallelResult {
+	requests := make([]ParallelRequest, len(paths))
+	for i, path := range paths {
+		requests[i] = ParallelRequest{
+			Method: http.MethodGet,
+			Path:   path,
+			Opts:   opts,
+		}
+	}
+	return c.Parallel(ctx, requests)
 }
 
 func (c *Client) do(ctx context.Context, method, path string, opts ...Option) (*Response, error) {
@@ -598,7 +681,6 @@ func (c *Client) do(ctx context.Context, method, path string, opts ...Option) (*
 	}
 
 	for attempt := 0; attempt < maxAttempts; attempt++ {
-		// Backoff before retry (not on first attempt)
 		if attempt > 0 && r.retryBackoff > 0 {
 			select {
 			case <-ctx.Done():
@@ -611,8 +693,7 @@ func (c *Client) do(ctx context.Context, method, path string, opts ...Option) (*
 		lastResp = resp
 		lastErr = err
 
-		// Check expected status
-		if err == nil && len(r.expectStatus) > 0 {
+		if err == nil && resp != nil && len(r.expectStatus) > 0 {
 			if !containsInt(r.expectStatus, resp.StatusCode) {
 				lastErr = &StatusError{
 					StatusCode: resp.StatusCode,
@@ -622,13 +703,11 @@ func (c *Client) do(ctx context.Context, method, path string, opts ...Option) (*
 			}
 		}
 
-		// Check retry condition
 		if r.retryWhen != nil {
 			if r.retryWhen(resp, lastErr) && attempt < maxAttempts-1 {
 				continue
 			}
 		} else if lastErr != nil && attempt < maxAttempts-1 {
-			// Default: retry on any error
 			continue
 		}
 
@@ -639,33 +718,38 @@ func (c *Client) do(ctx context.Context, method, path string, opts ...Option) (*
 }
 
 func (c *Client) doOnce(ctx context.Context, method, path string, r *request) (*Response, error) {
+	if c.http == nil {
+		c.http = &http.Client{Transport: DefaultTransport()}
+	}
+
 	if r.timeout > 0 {
 		var cancel context.CancelFunc
 		ctx, cancel = context.WithTimeout(ctx, r.timeout)
 		defer cancel()
 	}
 
-	fullURL := c.buildURL(path, r.query)
+	fullURL, err := c.buildURL(path, r.query)
+	if err != nil {
+		return nil, err
+	}
 
-	// Handle multipart
 	var contentType string
 	var body io.Reader = r.body
 
 	if r.multipart != nil {
-		b, ct, err := buildMultipart(r.multipart)
-		if err != nil {
-			return nil, err
-		}
-		body = b
-		contentType = ct
+		body, contentType = buildMultipartStream(r.multipart)
 	} else if r.bodyBytes != nil {
-		// Reset body for retry
 		body = bytes.NewReader(r.bodyBytes)
 	}
 
 	req, err := http.NewRequestWithContext(ctx, method, fullURL, body)
 	if err != nil {
 		return nil, err
+	}
+
+	// Set Content-Length for non-multipart known body (nice for some servers/proxies)
+	if r.multipart == nil && r.bodyBytes != nil {
+		req.ContentLength = int64(len(r.bodyBytes))
 	}
 
 	if contentType != "" {
@@ -676,12 +760,10 @@ func (c *Client) doOnce(ctx context.Context, method, path string, r *request) (*
 		req.Header.Set(k, v)
 	}
 
-	// Add request ID if configured
 	if c.requestID != nil {
 		req.Header.Set("X-Request-ID", c.requestID())
 	}
 
-	// Request interceptors
 	for _, fn := range c.onRequest {
 		fn(req)
 	}
@@ -692,7 +774,6 @@ func (c *Client) doOnce(ctx context.Context, method, path string, r *request) (*
 	}
 	defer resp.Body.Close()
 
-	// Response interceptors
 	for _, fn := range c.onResponse {
 		fn(resp)
 	}
@@ -702,11 +783,9 @@ func (c *Client) doOnce(ctx context.Context, method, path string, r *request) (*
 		Headers:    resp.Header,
 	}
 
-	// Stream to output if provided, otherwise buffer
 	if r.output != nil {
-		result.Written, err = io.Copy(r.output, resp.Body)
+		result.Written, err = copyBuffered(r.output, resp.Body)
 	} else {
-		// Use pooled buffer for reading
 		buf := getBuffer()
 		_, err = buf.ReadFrom(resp.Body)
 		if err == nil {
@@ -723,6 +802,13 @@ func (c *Client) doOnce(ctx context.Context, method, path string, r *request) (*
 	return result, nil
 }
 
+// copyBuffered uses pooled buffer for efficient copying
+func copyBuffered(dst io.Writer, src io.Reader) (int64, error) {
+	buf := getCopyBuf()
+	defer putCopyBuf(buf)
+	return io.CopyBuffer(dst, src, buf)
+}
+
 func containsInt(slice []int, val int) bool {
 	for _, v := range slice {
 		if v == val {
@@ -732,76 +818,89 @@ func containsInt(slice []int, val int) bool {
 	return false
 }
 
-func buildMultipart(m *Multipart) (io.Reader, string, error) {
-	buf := getBuffer()
-	w := multipart.NewWriter(buf)
+// buildMultipartStream streams multipart content (no full buffering in RAM)
+func buildMultipartStream(m *Multipart) (io.Reader, string) {
+	pr, pw := io.Pipe()
+	w := multipart.NewWriter(pw)
 
-	// Add files
-	for _, f := range m.Files {
-		filename := f.Path
-		if filename == "" {
-			filename = filepath.Base(f.Name)
+	go func() {
+		defer func() {
+			_ = w.Close()
+			_ = pw.Close()
+		}()
+
+		// files
+		for _, f := range m.Files {
+			filename := f.Path
+			if filename == "" {
+				// use field name as fallback (keeps same behavior as original code)
+				filename = filepath.Base(f.Name)
+			}
+			part, err := w.CreateFormFile(f.Name, filename)
+			if err != nil {
+				_ = pw.CloseWithError(err)
+				return
+			}
+			if _, err := copyBuffered(part, f.Reader); err != nil {
+				_ = pw.CloseWithError(err)
+				return
+			}
 		}
-		part, err := w.CreateFormFile(f.Name, filename)
-		if err != nil {
-			putBuffer(buf)
-			return nil, "", err
+
+		// fields
+		for k, v := range m.Fields {
+			if err := w.WriteField(k, v); err != nil {
+				_ = pw.CloseWithError(err)
+				return
+			}
 		}
-		if _, err := io.Copy(part, f.Reader); err != nil {
-			putBuffer(buf)
-			return nil, "", err
-		}
-	}
+	}()
 
-	// Add fields
-	for k, v := range m.Fields {
-		if err := w.WriteField(k, v); err != nil {
-			putBuffer(buf)
-			return nil, "", err
-		}
-	}
-
-	if err := w.Close(); err != nil {
-		putBuffer(buf)
-		return nil, "", err
-	}
-
-	// Copy to new buffer since we need to return it
-	result := make([]byte, buf.Len())
-	copy(result, buf.Bytes())
-	putBuffer(buf)
-
-	return bytes.NewReader(result), w.FormDataContentType(), nil
+	return pr, w.FormDataContentType()
 }
 
-func (c *Client) buildURL(path string, query map[string]string) string {
-	var fullURL string
-	if c.baseURL != "" && len(path) > 0 && path[0] == '/' {
-		fullURL = c.baseURL + path
-	} else {
-		fullURL = path
+func (c *Client) buildURL(path string, query map[string]string) (string, error) {
+	// Fast path: no query changes
+	if len(query) == 0 && c.baseURL == "" {
+		return path, nil
 	}
 
-	if len(query) == 0 {
-		return fullURL
-	}
-
-	// Use strings.Builder for efficient concatenation
-	var sb strings.Builder
-	sb.Grow(len(fullURL) + 64) // Pre-allocate
-	sb.WriteString(fullURL)
-	sb.WriteByte('?')
-
-	first := true
-	for k, v := range query {
-		if !first {
-			sb.WriteByte('&')
+	var u *url.URL
+	if c.baseURL != "" {
+		base, err := url.Parse(c.baseURL)
+		if err != nil {
+			return "", err
 		}
-		sb.WriteString(url.QueryEscape(k))
-		sb.WriteByte('=')
-		sb.WriteString(url.QueryEscape(v))
-		first = false
+		ref, err := url.Parse(path)
+		if err != nil {
+			return "", err
+		}
+		u = base.ResolveReference(ref)
+	} else {
+		parsed, err := url.Parse(path)
+		if err != nil {
+			return "", err
+		}
+		u = parsed
 	}
 
-	return sb.String()
+	// Merge query safely (handles existing ?a=1 already in path)
+	if len(query) > 0 {
+		q := u.Query()
+		for k, v := range query {
+			q.Set(k, v)
+		}
+		u.RawQuery = q.Encode()
+	}
+
+	// Keep behavior for relative paths without baseURL (but normalize)
+	s := u.String()
+
+	// url.Parse("abc") becomes Path "abc" and String "abc" ok;
+	// just ensure we don't introduce leading scheme-less weirdness
+	if c.baseURL == "" && !strings.Contains(path, "://") {
+		// if input was raw path like "/x", u.String() keeps it
+		return s, nil
+	}
+	return s, nil
 }
