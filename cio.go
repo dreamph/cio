@@ -377,6 +377,13 @@ func (c *Client) Cookies(rawURL string) ([]*http.Cookie, error) {
 	return c.http.Jar.Cookies(u), nil
 }
 
+// CloseIdleConnections closes idle connections held by the underlying transport
+func (c *Client) CloseIdleConnections() {
+	if tr, ok := c.http.Transport.(*http.Transport); ok {
+		tr.CloseIdleConnections()
+	}
+}
+
 // Response
 type Response struct {
 	StatusCode int
@@ -733,12 +740,6 @@ func (c *Client) Options(ctx context.Context, path string, opts ...Option) (*Res
 
 func (c *Client) Do(ctx context.Context, method, path string, opts ...Option) (*Response, error) {
 	return c.do(ctx, method, path, opts...)
-}
-
-func (c *Client) CloseIdleConnections() {
-	if tr, ok := c.http.Transport.(*http.Transport); ok {
-		tr.CloseIdleConnections()
-	}
 }
 
 // Parallel
