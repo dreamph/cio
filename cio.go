@@ -14,6 +14,8 @@ import (
 	"net/http/cookiejar"
 	"net/url"
 	"path/filepath"
+	"strings"
+	"sync"
 	"time"
 )
 
@@ -72,9 +74,65 @@ const (
 	OTF   = "font/otf"
 )
 
+// Buffer pools for reducing allocations
+var (
+	bufferPool = sync.Pool{
+		New: func() any {
+			return bytes.NewBuffer(make([]byte, 0, 4096))
+		},
+	}
+	requestPool = sync.Pool{
+		New: func() any {
+			return &request{
+				headers: make(map[string]string, 8),
+				query:   make(map[string]string, 4),
+			}
+		},
+	}
+)
+
+func getBuffer() *bytes.Buffer {
+	buf := bufferPool.Get().(*bytes.Buffer)
+	buf.Reset()
+	return buf
+}
+
+func putBuffer(buf *bytes.Buffer) {
+	if buf.Cap() <= 64*1024 { // Don't pool large buffers
+		bufferPool.Put(buf)
+	}
+}
+
+func getRequest() *request {
+	r := requestPool.Get().(*request)
+	// Reset fields
+	r.body = nil
+	r.bodyBytes = nil
+	r.output = nil
+	r.timeout = 0
+	r.multipart = nil
+	r.retry = 0
+	r.retryBackoff = 0
+	r.retryWhen = nil
+	r.expectStatus = r.expectStatus[:0]
+	// Clear maps
+	for k := range r.headers {
+		delete(r.headers, k)
+	}
+	for k := range r.query {
+		delete(r.query, k)
+	}
+	return r
+}
+
+func putRequest(r *request) {
+	requestPool.Put(r)
+}
+
 // Errors
 var (
 	ErrUnexpectedStatus = errors.New("unexpected status code")
+	ErrNoCookieJar      = errors.New("cookie jar not enabled, use WithCookieJar()")
 )
 
 // StatusError represents an HTTP status error
@@ -103,8 +161,8 @@ type Client struct {
 
 type ClientOption func(*Client)
 
-func BaseURL(url string) ClientOption {
-	return func(c *Client) { c.baseURL = url }
+func BaseURL(u string) ClientOption {
+	return func(c *Client) { c.baseURL = u }
 }
 
 func HTTPClient(hc *http.Client) ClientOption {
@@ -168,8 +226,24 @@ func WithTracing(serviceName string) ClientOption {
 	}
 }
 
+// DefaultTransport returns an optimized http.Transport for high performance
+func DefaultTransport() *http.Transport {
+	return &http.Transport{
+		MaxIdleConns:        100,
+		MaxIdleConnsPerHost: 100,
+		MaxConnsPerHost:     100,
+		IdleConnTimeout:     90 * time.Second,
+		DisableCompression:  false,
+		ForceAttemptHTTP2:   true,
+	}
+}
+
 func New(opts ...ClientOption) *Client {
-	c := &Client{http: &http.Client{}}
+	c := &Client{
+		http: &http.Client{
+			Transport: DefaultTransport(),
+		},
+	}
 	for _, opt := range opts {
 		opt(c)
 	}
@@ -179,7 +253,7 @@ func New(opts ...ClientOption) *Client {
 // SetCookies sets cookies for a URL
 func (c *Client) SetCookies(rawURL string, cookies []*http.Cookie) error {
 	if c.http.Jar == nil {
-		return errors.New("cookie jar not enabled, use WithCookieJar()")
+		return ErrNoCookieJar
 	}
 	u, err := url.Parse(rawURL)
 	if err != nil {
@@ -192,7 +266,7 @@ func (c *Client) SetCookies(rawURL string, cookies []*http.Cookie) error {
 // Cookies returns cookies for a URL
 func (c *Client) Cookies(rawURL string) ([]*http.Cookie, error) {
 	if c.http.Jar == nil {
-		return nil, errors.New("cookie jar not enabled, use WithCookieJar()")
+		return nil, ErrNoCookieJar
 	}
 	u, err := url.Parse(rawURL)
 	if err != nil {
@@ -269,8 +343,17 @@ func (cfg R) apply(r *request) {
 		r.query[k] = v
 	}
 	if cfg.Body != nil {
-		data, _ := json.Marshal(cfg.Body)
-		r.body = bytes.NewReader(data)
+		buf := getBuffer()
+		json.NewEncoder(buf).Encode(cfg.Body)
+		// Remove trailing newline from Encode
+		b := buf.Bytes()
+		if len(b) > 0 && b[len(b)-1] == '\n' {
+			b = b[:len(b)-1]
+		}
+		r.bodyBytes = make([]byte, len(b))
+		copy(r.bodyBytes, b)
+		r.body = bytes.NewReader(r.bodyBytes)
+		putBuffer(buf)
 	}
 }
 
@@ -297,18 +380,19 @@ type request struct {
 	expectStatus []int
 }
 
-func newRequest() *request {
-	return &request{
-		headers: make(map[string]string),
-		query:   make(map[string]string),
-	}
-}
-
 func Body(v any) Option {
 	return optionFunc(func(r *request) {
-		data, _ := json.Marshal(v)
-		r.body = bytes.NewReader(data)
-		r.bodyBytes = data // save for retry
+		buf := getBuffer()
+		json.NewEncoder(buf).Encode(v)
+		// Remove trailing newline from Encode
+		b := buf.Bytes()
+		if len(b) > 0 && b[len(b)-1] == '\n' {
+			b = b[:len(b)-1]
+		}
+		r.bodyBytes = make([]byte, len(b))
+		copy(r.bodyBytes, b)
+		r.body = bytes.NewReader(r.bodyBytes)
+		putBuffer(buf)
 	})
 }
 
@@ -341,7 +425,7 @@ func FormFields(fields map[string]string) Option {
 			r.multipart = &Multipart{}
 		}
 		if r.multipart.Fields == nil {
-			r.multipart.Fields = make(map[string]string)
+			r.multipart.Fields = make(map[string]string, len(fields))
 		}
 		for k, v := range fields {
 			r.multipart.Fields[k] = v
@@ -365,14 +449,20 @@ func Retry(count, backoffMs int, conditions ...RetryCondition) Option {
 
 // WhenStatus retries on specific status codes
 func WhenStatus(codes ...int) RetryCondition {
+	// Pre-build map for O(1) lookup
+	codeMap := make(map[int]struct{}, len(codes))
+	for _, c := range codes {
+		codeMap[c] = struct{}{}
+	}
 	return func(resp *Response, err error) bool {
 		if err != nil {
-			return true // retry on error
+			return true
 		}
 		if resp == nil {
 			return true
 		}
-		return containsInt(codes, resp.StatusCode)
+		_, ok := codeMap[resp.StatusCode]
+		return ok
 	}
 }
 
@@ -411,10 +501,13 @@ func ExpectStatus(codes ...int) Option {
 	})
 }
 
+// Pre-allocated 2xx status codes for ExpectOK
+var okStatusCodes = []int{200, 201, 202, 203, 204, 205, 206, 207, 208, 226}
+
 // ExpectOK expects 2xx status codes
 func ExpectOK() Option {
 	return optionFunc(func(r *request) {
-		r.expectStatus = []int{200, 201, 202, 203, 204, 205, 206, 207, 208, 226}
+		r.expectStatus = okStatusCodes
 	})
 }
 
@@ -461,8 +554,11 @@ func Header(key, value string) HeaderOption {
 	return func(r *request) { r.headers[key] = value }
 }
 
+// Pre-allocated bearer prefix
+const bearerPrefix = "Bearer "
+
 func Bearer(token string) HeaderOption {
-	return func(r *request) { r.headers["Authorization"] = "Bearer " + token }
+	return func(r *request) { r.headers["Authorization"] = bearerPrefix + token }
 }
 
 // HTTP methods
@@ -487,7 +583,9 @@ func (c *Client) Delete(ctx context.Context, path string, opts ...Option) (*Resp
 }
 
 func (c *Client) do(ctx context.Context, method, path string, opts ...Option) (*Response, error) {
-	r := newRequest()
+	r := getRequest()
+	defer putRequest(r)
+
 	for _, opt := range opts {
 		opt.apply(r)
 	}
@@ -608,7 +706,14 @@ func (c *Client) doOnce(ctx context.Context, method, path string, r *request) (*
 	if r.output != nil {
 		result.Written, err = io.Copy(r.output, resp.Body)
 	} else {
-		result.Body, err = io.ReadAll(resp.Body)
+		// Use pooled buffer for reading
+		buf := getBuffer()
+		_, err = buf.ReadFrom(resp.Body)
+		if err == nil {
+			result.Body = make([]byte, buf.Len())
+			copy(result.Body, buf.Bytes())
+		}
+		putBuffer(buf)
 	}
 
 	if err != nil {
@@ -628,8 +733,8 @@ func containsInt(slice []int, val int) bool {
 }
 
 func buildMultipart(m *Multipart) (io.Reader, string, error) {
-	var buf bytes.Buffer
-	w := multipart.NewWriter(&buf)
+	buf := getBuffer()
+	w := multipart.NewWriter(buf)
 
 	// Add files
 	for _, f := range m.Files {
@@ -639,9 +744,11 @@ func buildMultipart(m *Multipart) (io.Reader, string, error) {
 		}
 		part, err := w.CreateFormFile(f.Name, filename)
 		if err != nil {
+			putBuffer(buf)
 			return nil, "", err
 		}
 		if _, err := io.Copy(part, f.Reader); err != nil {
+			putBuffer(buf)
 			return nil, "", err
 		}
 	}
@@ -649,30 +756,52 @@ func buildMultipart(m *Multipart) (io.Reader, string, error) {
 	// Add fields
 	for k, v := range m.Fields {
 		if err := w.WriteField(k, v); err != nil {
+			putBuffer(buf)
 			return nil, "", err
 		}
 	}
 
 	if err := w.Close(); err != nil {
+		putBuffer(buf)
 		return nil, "", err
 	}
 
-	return &buf, w.FormDataContentType(), nil
+	// Copy to new buffer since we need to return it
+	result := make([]byte, buf.Len())
+	copy(result, buf.Bytes())
+	putBuffer(buf)
+
+	return bytes.NewReader(result), w.FormDataContentType(), nil
 }
 
 func (c *Client) buildURL(path string, query map[string]string) string {
-	fullURL := path
+	var fullURL string
 	if c.baseURL != "" && len(path) > 0 && path[0] == '/' {
 		fullURL = c.baseURL + path
+	} else {
+		fullURL = path
 	}
 
-	if len(query) > 0 {
-		params := url.Values{}
-		for k, v := range query {
-			params.Set(k, v)
+	if len(query) == 0 {
+		return fullURL
+	}
+
+	// Use strings.Builder for efficient concatenation
+	var sb strings.Builder
+	sb.Grow(len(fullURL) + 64) // Pre-allocate
+	sb.WriteString(fullURL)
+	sb.WriteByte('?')
+
+	first := true
+	for k, v := range query {
+		if !first {
+			sb.WriteByte('&')
 		}
-		fullURL += "?" + params.Encode()
+		sb.WriteString(url.QueryEscape(k))
+		sb.WriteByte('=')
+		sb.WriteString(url.QueryEscape(v))
+		first = false
 	}
 
-	return fullURL
+	return sb.String()
 }
