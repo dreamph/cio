@@ -16,11 +16,13 @@ import (
 	"net"
 	"net/http"
 	"net/http/cookiejar"
+	"net/http/httptrace"
 	"net/http/httputil"
 	"net/url"
 	"os"
 	"path/filepath"
 	"strconv"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -138,36 +140,39 @@ func NewRateLimiter(rate float64, burst int) *RateLimiter {
 
 // Allow checks if a request is allowed, blocks until allowed or context cancelled
 func (rl *RateLimiter) Allow(ctx context.Context) error {
-	rl.mu.Lock()
-
-	now := time.Now()
-	elapsed := now.Sub(rl.lastTime).Seconds()
-	rl.tokens = math.Min(float64(rl.burst), rl.tokens+elapsed*rl.rate)
-	rl.lastTime = now
-
-	if rl.tokens >= 1 {
-		rl.tokens--
-		rl.mu.Unlock()
-		return nil
-	}
-
-	// Calculate wait time and release lock while waiting
-	waitTime := time.Duration((1 - rl.tokens) / rl.rate * float64(time.Second))
-	rl.mu.Unlock()
-
-	// Wait with timer (avoid alloc with reusable timer if needed in hot path)
-	t := time.NewTimer(waitTime)
-	defer t.Stop()
-
-	select {
-	case <-ctx.Done():
-		return ctx.Err()
-	case <-t.C:
-		// Re-acquire and consume token
+	for {
 		rl.mu.Lock()
-		rl.tokens--
+
+		now := time.Now()
+		elapsed := now.Sub(rl.lastTime).Seconds()
+		rl.tokens = math.Min(float64(rl.burst), rl.tokens+elapsed*rl.rate)
+		rl.lastTime = now
+
+		if rl.tokens >= 1 {
+			rl.tokens--
+			rl.mu.Unlock()
+			return nil
+		}
+
+		waitSeconds := (1 - rl.tokens) / rl.rate
 		rl.mu.Unlock()
-		return nil
+
+		if waitSeconds <= 0 {
+			// recalc loop
+			continue
+		}
+
+		waitTime := time.Duration(waitSeconds * float64(time.Second))
+		t := time.NewTimer(waitTime)
+
+		select {
+		case <-ctx.Done():
+			t.Stop()
+			return ctx.Err()
+		case <-t.C:
+			t.Stop()
+			// loop เพื่อคำนวณ token ใหม่อีกรอบ
+		}
 	}
 }
 
@@ -475,7 +480,7 @@ func WithRedirects(max int) ClientOption {
 	}
 }
 
-func NoRedirects() ClientOption { return WithRedirects(0) }
+func DisableRedirects() ClientOption { return WithRedirects(0) }
 
 // WithRequestID sets a function to generate request IDs (added as X-Request-ID header)
 func WithRequestID(fn func() string) ClientOption {
@@ -495,6 +500,25 @@ func WithTracing(serviceName string) ClientOption {
 		c.onRequest = append(c.onRequest, func(req *http.Request) {
 			req.Header.Set("X-Service-Name", serviceName)
 		})
+	}
+}
+
+// DisableKeepAlive disables HTTP keep-alive / connection reuse.
+// Each request will open a new TCP connection.
+func DisableKeepAlive() ClientOption {
+	return func(c *Client) {
+		c.ensureHTTP()
+
+		tr, ok := c.http.Transport.(*http.Transport)
+		if !ok || tr == nil {
+			tr = DefaultTransport()
+		}
+
+		tr.DisableKeepAlives = true
+		tr.MaxIdleConns = 0
+		tr.MaxIdleConnsPerHost = 0
+
+		c.http.Transport = tr
 	}
 }
 
@@ -1067,11 +1091,13 @@ func FormURLEncoded(data map[string]string) Option {
 			values.Set(k, v)
 		}
 		encoded := values.Encode()
-		r.bodyBytes = []byte(encoded)
+		b := []byte(encoded)
+
+		r.bodyBytes = b
 		r.bodyContentType = Form
-		r.bodyContentLength = int64(len(encoded))
+		r.bodyContentLength = int64(len(b))
 		r.bodyFactory = func() (io.ReadCloser, string, int64, error) {
-			return io.NopCloser(bytes.NewReader([]byte(encoded))), Form, int64(len(encoded)), nil
+			return io.NopCloser(bytes.NewReader(b)), Form, int64(len(b)), nil
 		}
 		r.nonRepeatableBody = false
 	})
@@ -1081,11 +1107,13 @@ func FormURLEncoded(data map[string]string) Option {
 func FormURLEncodedValues(data url.Values) Option {
 	return optionFunc(func(r *request) {
 		encoded := data.Encode()
-		r.bodyBytes = []byte(encoded)
+		b := []byte(encoded)
+
+		r.bodyBytes = b
 		r.bodyContentType = Form
-		r.bodyContentLength = int64(len(encoded))
+		r.bodyContentLength = int64(len(b))
 		r.bodyFactory = func() (io.ReadCloser, string, int64, error) {
-			return io.NopCloser(bytes.NewReader([]byte(encoded))), Form, int64(len(encoded)), nil
+			return io.NopCloser(bytes.NewReader(b)), Form, int64(len(b)), nil
 		}
 		r.nonRepeatableBody = false
 	})
@@ -1173,11 +1201,8 @@ func CacheControl(directive string) Option {
 	return optionFunc(func(r *request) { r.ensureHeaders()["Cache-Control"] = directive })
 }
 
-// NoCache sets Cache-Control: no-cache
-func NoCache() Option { return CacheControl("no-cache") }
-
-// NoStore sets Cache-Control: no-store
-func NoStore() Option { return CacheControl("no-store") }
+// DisableCache sets Cache-Control: no-cache
+func DisableCache() Option { return CacheControl("no-cache") }
 
 // RetryCondition determines if request should be retried
 type RetryCondition func(resp *Response, err error) bool
@@ -1407,13 +1432,6 @@ func (c *Client) do(ctx context.Context, method, path string, opts ...Option) (*
 		r.nonRepeatableBody = false
 	}
 
-	// Gzip compression
-	if r.gzipRequest && r.bodyFactory != nil {
-		originalFactory := r.bodyFactory
-		r.bodyFactory = gzipBody(originalFactory)
-		r.ensureHeaders()["Content-Encoding"] = "gzip"
-	}
-
 	// attach multipart => make bodyFactory (streaming) per attempt with context awareness
 	if r.multipart != nil {
 		m := r.multipart // capture for closure
@@ -1424,6 +1442,13 @@ func (c *Client) do(ctx context.Context, method, path string, opts ...Option) (*
 		if !multipartRepeatable(r.multipart) {
 			r.nonRepeatableBody = true
 		}
+	}
+
+	// Gzip compression (wrap bodyFactory ที่สร้างเสร็จแล้ว)
+	if r.gzipRequest && r.bodyFactory != nil {
+		originalFactory := r.bodyFactory
+		r.bodyFactory = gzipBody(originalFactory)
+		r.ensureHeaders()["Content-Encoding"] = "gzip"
 	}
 
 	maxAttempts := r.retry + 1
@@ -1584,6 +1609,50 @@ func (c *Client) doOnce(ctx context.Context, method, fullURL string, r *request)
 		defer cancel()
 	}
 
+	reqStart := time.Now()
+
+	// Trace hook
+	var traceInfo *TraceInfo
+	if r.traceEnabled {
+		ti := &TraceInfo{}
+		traceInfo = ti
+
+		var dnsStart, connStart time.Time
+
+		clientTrace := &httptrace.ClientTrace{
+			DNSStart: func(info httptrace.DNSStartInfo) {
+				dnsStart = time.Now()
+			},
+			DNSDone: func(info httptrace.DNSDoneInfo) {
+				if !dnsStart.IsZero() {
+					ti.DNSLookup = time.Since(dnsStart)
+				}
+			},
+			ConnectStart: func(network, addr string) {
+				connStart = time.Now()
+			},
+			ConnectDone: func(network, addr string, err error) {
+				if err == nil && !connStart.IsZero() {
+					ti.ConnectTime = time.Since(connStart)
+					ti.RemoteAddr = addr
+				}
+			},
+			GotConn: func(info httptrace.GotConnInfo) {
+				ti.WasReused = info.Reused
+				if info.Conn != nil {
+					if la := info.Conn.LocalAddr(); la != nil {
+						ti.LocalAddr = la.String()
+					}
+				}
+			},
+			GotFirstResponseByte: func() {
+				ti.FirstByteTime = time.Since(reqStart)
+			},
+		}
+
+		ctx = httptrace.WithClientTrace(ctx, clientTrace)
+	}
+
 	var (
 		body          io.ReadCloser
 		contentType   string
@@ -1686,11 +1755,28 @@ func (c *Client) doOnce(ctx context.Context, method, fullURL string, r *request)
 		fn(raw)
 	}
 
+	// manual decompress (กรณี transport.DisableCompression = true)
+	if r.decompressResp {
+		if enc := raw.Header.Get("Content-Encoding"); enc == "gzip" {
+			gzr, err := decompressReader(raw.Body)
+			if err != nil {
+				return nil, fmt.Errorf("decompress response: %w", err)
+			}
+			raw.Body = gzr
+			raw.Header.Del("Content-Encoding")
+		}
+	}
+
 	out := &Response{
 		StatusCode: raw.StatusCode,
 		Headers:    raw.Header,
 		client:     c,
 		Ctx:        ctx,
+		Trace:      traceInfo,
+	}
+
+	if traceInfo != nil {
+		traceInfo.TotalTime = time.Since(reqStart)
 	}
 
 	// Capture raw request/response if requested
@@ -1981,24 +2067,22 @@ func copyWithContext(ctx context.Context, dst io.Writer, src io.Reader) (int64, 
 func (c *Client) buildURL(path string, q url.Values) (string, error) {
 	var u *url.URL
 
-	// Use cached parsed base URL
 	if c.parsedBaseURL != nil {
-		ref, err := url.Parse(path)
-		if err != nil {
-			return "", err
+		// clone base
+		base := *c.parsedBaseURL
+
+		// normalize path join
+		base.Path = strings.TrimRight(base.Path, "/")
+
+		if strings.HasPrefix(path, "/") {
+			path = "/" + strings.TrimLeft(path, "/")
+		} else if path != "" {
+			path = "/" + path
 		}
-		u = c.parsedBaseURL.ResolveReference(ref)
-	} else if c.baseURL != "" {
-		// Fallback if somehow not cached
-		base, err := url.Parse(c.baseURL)
-		if err != nil {
-			return "", err
-		}
-		ref, err := url.Parse(path)
-		if err != nil {
-			return "", err
-		}
-		u = base.ResolveReference(ref)
+
+		base.Path = base.Path + path
+		u = &base
+
 	} else {
 		parsed, err := url.Parse(path)
 		if err != nil {
@@ -2007,13 +2091,11 @@ func (c *Client) buildURL(path string, q url.Values) (string, error) {
 		u = parsed
 	}
 
-	// Optimize query merging
+	// merge query
 	if len(q) > 0 {
 		if u.RawQuery == "" {
-			// No existing query - encode directly (skip parse)
 			u.RawQuery = q.Encode()
 		} else {
-			// Has existing query - must parse and merge
 			existing := u.Query()
 			for k, vs := range q {
 				for _, v := range vs {
@@ -2283,22 +2365,24 @@ func gzipBody(factory func() (io.ReadCloser, string, int64, error)) func() (io.R
 		}
 
 		pr, pw := io.Pipe()
-		gz := gzip.NewWriter(pw)
 
 		go func() {
 			defer rc.Close()
 
+			gz := gzip.NewWriter(pw)
+			// ปิดฝั่ง writer ให้ตรงตาม error
+			var copyErr error
 			if _, err := io.Copy(gz, rc); err != nil {
-				_ = gz.Close()
-				_ = pw.CloseWithError(err)
-				return
+				copyErr = err
+			}
+			if err := gz.Close(); err != nil && copyErr == nil {
+				copyErr = err
 			}
 
-			if err := gz.Close(); err != nil {
-				_ = pw.CloseWithError(err)
+			if copyErr != nil {
+				_ = pw.CloseWithError(copyErr)
 				return
 			}
-
 			_ = pw.Close()
 		}()
 
@@ -2306,7 +2390,28 @@ func gzipBody(factory func() (io.ReadCloser, string, int64, error)) func() (io.R
 	}
 }
 
+type gzipReadCloser struct {
+	*gzip.Reader
+	src io.Closer
+}
+
+func (g *gzipReadCloser) Close() error {
+	err1 := g.Reader.Close()
+	err2 := g.src.Close()
+	if err1 != nil {
+		return err1
+	}
+	return err2
+}
+
 // decompressReader wraps a reader to decompress gzip
 func decompressReader(r io.Reader) (io.ReadCloser, error) {
-	return gzip.NewReader(r)
+	gr, err := gzip.NewReader(r)
+	if err != nil {
+		return nil, err
+	}
+	if rc, ok := r.(io.ReadCloser); ok {
+		return &gzipReadCloser{Reader: gr, src: rc}, nil
+	}
+	return gr, nil
 }
