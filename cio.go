@@ -17,6 +17,7 @@ import (
 	"net/http/cookiejar"
 	"net/url"
 	"path/filepath"
+	"strconv"
 	"sync"
 	"time"
 )
@@ -494,6 +495,41 @@ func Json[T any](r *Response) (T, error) {
 	var v T
 	err := r.Json(&v)
 	return v, err
+}
+
+// ContentLength returns Content-Length header value, -1 if unknown
+func (r *Response) ContentLength() int64 {
+	if v := r.Headers.Get("Content-Length"); v != "" {
+		if n, err := strconv.ParseInt(v, 10, 64); err == nil {
+			return n
+		}
+	}
+	return -1
+}
+
+// ContentType returns Content-Type header value (e.g. "application/json")
+func (r *Response) ContentType() string {
+	return r.Headers.Get("Content-Type")
+}
+
+// ETag returns ETag header value (e.g. `"abc123"` or `W/"abc123"`)
+func (r *Response) ETag() string {
+	return r.Headers.Get("ETag")
+}
+
+// LastModified returns Last-Modified header as time.Time, zero time if not present or invalid
+func (r *Response) LastModified() time.Time {
+	if v := r.Headers.Get("Last-Modified"); v != "" {
+		if t, err := http.ParseTime(v); err == nil {
+			return t
+		}
+	}
+	return time.Time{}
+}
+
+// AcceptRanges returns true if server supports range requests (Accept-Ranges: bytes)
+func (r *Response) AcceptRanges() bool {
+	return r.Headers.Get("Accept-Ranges") == "bytes"
 }
 
 // File represents a file for multipart upload
