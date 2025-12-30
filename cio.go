@@ -2,6 +2,7 @@ package cio
 
 import (
 	"bytes"
+	"compress/gzip"
 	"context"
 	crand "crypto/rand"
 	"encoding/hex"
@@ -15,10 +16,13 @@ import (
 	"net"
 	"net/http"
 	"net/http/cookiejar"
+	"net/http/httputil"
 	"net/url"
+	"os"
 	"path/filepath"
 	"strconv"
 	"sync"
+	"sync/atomic"
 	"time"
 )
 
@@ -69,98 +73,29 @@ const (
 // Buffer sizes
 const (
 	defaultBufferSize = 32 * 1024
-	maxPoolBufferCap  = 64 * 1024
 )
 
-// Pools
-var (
-	bufferPool = sync.Pool{
-		New: func() any {
-			return bytes.NewBuffer(make([]byte, 0, defaultBufferSize))
-		},
-	}
-	requestPool = sync.Pool{
-		New: func() any {
-			return &request{
-				headers: make(map[string]string, 8),
-				query:   make(url.Values, 4),
-			}
-		},
-	}
-	copyBufPool = sync.Pool{
-		New: func() any { return make([]byte, defaultBufferSize) },
-	}
-)
-
-// rng for jitter
-var (
-	rngMu sync.Mutex
-	rng   = mrand.New(mrand.NewSource(time.Now().UnixNano()))
-)
-
-func jitter01() float64 {
-	rngMu.Lock()
-	v := rng.Float64()
-	rngMu.Unlock()
-	return v
-}
-
-func getBuffer() *bytes.Buffer {
-	buf := bufferPool.Get().(*bytes.Buffer)
-	buf.Reset()
-	return buf
-}
-func putBuffer(buf *bytes.Buffer) {
-	if buf.Cap() <= maxPoolBufferCap {
-		bufferPool.Put(buf)
+func newRequest() *request {
+	return &request{
+		bodyContentLength: -1,
 	}
 }
 
-func getCopyBuf() []byte { return copyBufPool.Get().([]byte) }
-func putCopyBuf(b []byte) {
-	if cap(b) >= defaultBufferSize {
-		copyBufPool.Put(b[:defaultBufferSize])
-		return
+// ensureHeaders lazily initializes headers map
+func (r *request) ensureHeaders() map[string]string {
+	if r.headers == nil {
+		r.headers = make(map[string]string, 8)
 	}
-	copyBufPool.Put(b)
+	return r.headers
 }
 
-func getRequest() *request {
-	r := requestPool.Get().(*request)
-
-	r.timeout = 0
-	r.output = nil
-
-	r.bodyBytes = nil
-	r.bodyFactory = nil
-	r.bodyContentType = ""
-	r.bodyContentLength = -1
-	r.nonRepeatableBody = false
-	r.jsonValue = nil
-
-	r.multipart = nil
-
-	r.retry = 0
-	r.retryBase = 0
-	r.retryMax = 0
-	r.retryWhen = nil
-
-	r.maxBodyBytes = 0
-
-	r.expectStatusSet = nil
-	r.expectStatusList = r.expectStatusList[:0]
-
-	for k := range r.headers {
-		delete(r.headers, k)
+// ensureQuery lazily initializes query map
+func (r *request) ensureQuery() url.Values {
+	if r.query == nil {
+		r.query = make(url.Values, 4)
 	}
-	// clear url.Values
-	for k := range r.query {
-		delete(r.query, k)
-	}
-
-	return r
+	return r.query
 }
-func putRequest(r *request) { requestPool.Put(r) }
 
 // Errors
 var (
@@ -168,7 +103,196 @@ var (
 	ErrNoCookieJar      = errors.New("cookie jar not enabled, use WithCookieJar()")
 	ErrBodyTooLarge     = errors.New("response body exceeds MaxBodyBytes")
 	ErrNonRepeatable    = errors.New("request body is non-repeatable; retry is not supported without BodyFunc/seekable body")
+	ErrStopStream       = errors.New("stop stream") // graceful stop for OnStream/OnStreamRaw
+	ErrRateLimited      = errors.New("rate limit exceeded")
+	ErrCircuitOpen      = errors.New("circuit breaker is open")
 )
+
+// JitterType determines jitter strategy for retries
+type JitterType int
+
+const (
+	JitterFull         JitterType = iota // Full jitter: [0, backoff)
+	JitterEqual                          // Equal jitter: backoff/2 + [0, backoff/2)
+	JitterDecorrelated                   // Decorrelated: [base, prev * 3)
+)
+
+// RateLimiter implements token bucket rate limiting
+type RateLimiter struct {
+	rate     float64   // tokens per second
+	burst    int64     // max tokens
+	tokens   float64   // current tokens
+	lastTime time.Time // last token update
+	mu       sync.Mutex
+}
+
+// NewRateLimiter creates a rate limiter with given rate (req/s) and burst size
+func NewRateLimiter(rate float64, burst int) *RateLimiter {
+	return &RateLimiter{
+		rate:     rate,
+		burst:    int64(burst),
+		tokens:   float64(burst),
+		lastTime: time.Now(),
+	}
+}
+
+// Allow checks if a request is allowed, blocks until allowed or context cancelled
+func (rl *RateLimiter) Allow(ctx context.Context) error {
+	rl.mu.Lock()
+
+	now := time.Now()
+	elapsed := now.Sub(rl.lastTime).Seconds()
+	rl.tokens = math.Min(float64(rl.burst), rl.tokens+elapsed*rl.rate)
+	rl.lastTime = now
+
+	if rl.tokens >= 1 {
+		rl.tokens--
+		rl.mu.Unlock()
+		return nil
+	}
+
+	// Calculate wait time and release lock while waiting
+	waitTime := time.Duration((1 - rl.tokens) / rl.rate * float64(time.Second))
+	rl.mu.Unlock()
+
+	// Wait with timer (avoid alloc with reusable timer if needed in hot path)
+	t := time.NewTimer(waitTime)
+	defer t.Stop()
+
+	select {
+	case <-ctx.Done():
+		return ctx.Err()
+	case <-t.C:
+		// Re-acquire and consume token
+		rl.mu.Lock()
+		rl.tokens--
+		rl.mu.Unlock()
+		return nil
+	}
+}
+
+// TryAllow checks if a request is allowed without blocking
+func (rl *RateLimiter) TryAllow() bool {
+	rl.mu.Lock()
+	defer rl.mu.Unlock()
+
+	now := time.Now()
+	elapsed := now.Sub(rl.lastTime).Seconds()
+	rl.tokens = math.Min(float64(rl.burst), rl.tokens+elapsed*rl.rate)
+	rl.lastTime = now
+
+	if rl.tokens >= 1 {
+		rl.tokens--
+		return true
+	}
+	return false
+}
+
+// CircuitState represents circuit breaker state
+type CircuitState int32
+
+const (
+	CircuitClosed CircuitState = iota
+	CircuitOpen
+	CircuitHalfOpen
+)
+
+// CircuitBreaker implements the circuit breaker pattern
+type CircuitBreaker struct {
+	failureThreshold int64         // failures before opening
+	successThreshold int64         // successes to close from half-open
+	timeout          time.Duration // time in open state before half-open
+
+	failures  int64
+	successes int64
+	state     int32 // atomic CircuitState
+	lastFail  time.Time
+	mu        sync.Mutex
+}
+
+// NewCircuitBreaker creates a circuit breaker
+func NewCircuitBreaker(failureThreshold, successThreshold int, timeout time.Duration) *CircuitBreaker {
+	return &CircuitBreaker{
+		failureThreshold: int64(failureThreshold),
+		successThreshold: int64(successThreshold),
+		timeout:          timeout,
+	}
+}
+
+// Allow checks if request is allowed through circuit breaker
+func (cb *CircuitBreaker) Allow() error {
+	state := CircuitState(atomic.LoadInt32(&cb.state))
+
+	switch state {
+	case CircuitOpen:
+		cb.mu.Lock()
+		if time.Since(cb.lastFail) > cb.timeout {
+			atomic.StoreInt32(&cb.state, int32(CircuitHalfOpen))
+			cb.successes = 0
+			cb.mu.Unlock()
+			return nil
+		}
+		cb.mu.Unlock()
+		return ErrCircuitOpen
+	case CircuitHalfOpen:
+		return nil
+	default: // Closed
+		return nil
+	}
+}
+
+// RecordSuccess records a successful request
+func (cb *CircuitBreaker) RecordSuccess() {
+	state := CircuitState(atomic.LoadInt32(&cb.state))
+
+	cb.mu.Lock()
+	defer cb.mu.Unlock()
+
+	switch state {
+	case CircuitHalfOpen:
+		cb.successes++
+		if cb.successes >= cb.successThreshold {
+			atomic.StoreInt32(&cb.state, int32(CircuitClosed))
+			cb.failures = 0
+		}
+	case CircuitClosed:
+		cb.failures = 0
+	}
+}
+
+// RecordFailure records a failed request
+func (cb *CircuitBreaker) RecordFailure() {
+	cb.mu.Lock()
+	defer cb.mu.Unlock()
+
+	state := CircuitState(atomic.LoadInt32(&cb.state))
+
+	switch state {
+	case CircuitHalfOpen:
+		atomic.StoreInt32(&cb.state, int32(CircuitOpen))
+		cb.lastFail = time.Now()
+	case CircuitClosed:
+		cb.failures++
+		if cb.failures >= cb.failureThreshold {
+			atomic.StoreInt32(&cb.state, int32(CircuitOpen))
+			cb.lastFail = time.Now()
+		}
+	}
+}
+
+// State returns current circuit state
+func (cb *CircuitBreaker) State() CircuitState {
+	return CircuitState(atomic.LoadInt32(&cb.state))
+}
+
+// Reset resets the circuit breaker to closed state
+func (cb *CircuitBreaker) Reset() {
+	cb.mu.Lock()
+	defer cb.mu.Unlock()
+	atomic.StoreInt32(&cb.state, int32(CircuitClosed))
+	cb.failures = 0
+	cb.successes = 0
+}
 
 // StatusError represents an HTTP status error with request context for debugging
 type StatusError struct {
@@ -204,15 +328,18 @@ type (
 type RequestInterceptor func(*http.Request)
 type ResponseInterceptor func(*http.Response)
 type AfterReadInterceptor func(resp *Response, raw *http.Response)
+type MetricsInterceptor func(method, path string, status int, duration time.Duration, err error)
 
 // Client
 type Client struct {
-	http    *http.Client
-	baseURL string
+	http          *http.Client
+	baseURL       string
+	parsedBaseURL *url.URL // cached parsed base URL
 
 	onRequest  []RequestInterceptor
 	onResponse []ResponseInterceptor
 	onAfter    []AfterReadInterceptor
+	onMetrics  []MetricsInterceptor
 
 	requestID func() string
 
@@ -226,12 +353,21 @@ type Client struct {
 	// json codec
 	jsonMarshal   JSONMarshal
 	jsonUnmarshal JSONUnmarshal
+
+	// rate limiting & circuit breaker
+	rateLimiter    *RateLimiter
+	circuitBreaker *CircuitBreaker
 }
 
 type ClientOption func(*Client)
 
 func BaseURL(u string) ClientOption {
-	return func(c *Client) { c.baseURL = u }
+	return func(c *Client) {
+		c.baseURL = u
+		if u != "" {
+			c.parsedBaseURL, _ = url.Parse(u)
+		}
+	}
 }
 
 func HTTPClient(hc *http.Client) ClientOption {
@@ -255,6 +391,12 @@ func OnResponse(fn ResponseInterceptor) ClientOption {
 }
 func OnAfterRead(fn AfterReadInterceptor) ClientOption {
 	return func(c *Client) { c.onAfter = append(c.onAfter, fn) }
+}
+
+// OnMetrics adds a metrics callback that fires after each request completes.
+// Receives method, path (without query), status code, duration, and error (if any).
+func OnMetrics(fn MetricsInterceptor) ClientOption {
+	return func(c *Client) { c.onMetrics = append(c.onMetrics, fn) }
 }
 
 func WithDefaultHeaders(h map[string]string) ClientOption {
@@ -286,6 +428,26 @@ func WithJSONCodec(marshal JSONMarshal, unmarshal JSONUnmarshal) ClientOption {
 		c.jsonMarshal = marshal
 		c.jsonUnmarshal = unmarshal
 	}
+}
+
+// WithRateLimiter sets a rate limiter for all requests
+func WithRateLimiter(rl *RateLimiter) ClientOption {
+	return func(c *Client) { c.rateLimiter = rl }
+}
+
+// WithRateLimit creates and sets a rate limiter (requests per second, burst size)
+func WithRateLimit(rps float64, burst int) ClientOption {
+	return func(c *Client) { c.rateLimiter = NewRateLimiter(rps, burst) }
+}
+
+// WithCircuitBreaker sets a circuit breaker for all requests
+func WithCircuitBreaker(cb *CircuitBreaker) ClientOption {
+	return func(c *Client) { c.circuitBreaker = cb }
+}
+
+// WithCircuit creates and sets a circuit breaker (failure threshold, success threshold, timeout)
+func WithCircuit(failures, successes int, timeout time.Duration) ClientOption {
+	return func(c *Client) { c.circuitBreaker = NewCircuitBreaker(failures, successes, timeout) }
 }
 
 // WithCookieJar enables cookie management
@@ -377,6 +539,7 @@ func (c *Client) Clone(opts ...ClientOption) *Client {
 	clone := &Client{
 		http:           c.http,
 		baseURL:        c.baseURL,
+		parsedBaseURL:  c.parsedBaseURL,
 		requestID:      c.requestID,
 		userAgent:      c.userAgent,
 		basicUser:      c.basicUser,
@@ -384,6 +547,8 @@ func (c *Client) Clone(opts ...ClientOption) *Client {
 		defaultTimeout: c.defaultTimeout,
 		jsonMarshal:    c.jsonMarshal,
 		jsonUnmarshal:  c.jsonUnmarshal,
+		rateLimiter:    c.rateLimiter,
+		circuitBreaker: c.circuitBreaker,
 	}
 
 	// Copy slices
@@ -398,6 +563,10 @@ func (c *Client) Clone(opts ...ClientOption) *Client {
 	if len(c.onAfter) > 0 {
 		clone.onAfter = make([]AfterReadInterceptor, len(c.onAfter))
 		copy(clone.onAfter, c.onAfter)
+	}
+	if len(c.onMetrics) > 0 {
+		clone.onMetrics = make([]MetricsInterceptor, len(c.onMetrics))
+		copy(clone.onMetrics, c.onMetrics)
 	}
 
 	// Copy map
@@ -464,12 +633,30 @@ func (c *Client) CloseIdleConnections() {
 	}
 }
 
+// TraceInfo contains detailed timing information for a request
+type TraceInfo struct {
+	DNSLookup     time.Duration
+	ConnectTime   time.Duration
+	TLSHandshake  time.Duration
+	FirstByteTime time.Duration
+	TotalTime     time.Duration
+	RemoteAddr    string
+	LocalAddr     string
+	WasReused     bool
+}
+
 // Response
 type Response struct {
 	StatusCode int
 	Headers    http.Header
 	Body       []byte
 	Written    int64 // bytes written when using OutputStream
+
+	// Extended info (populated when requested)
+	Ctx         context.Context // request context
+	RawRequest  *http.Request   // original request (when WithRawCapture)
+	RawResponse *http.Response  // original response (when WithRawCapture)
+	Trace       *TraceInfo      // timing info (when WithTrace)
 
 	client *Client // internal reference for JSON decoding
 }
@@ -480,6 +667,39 @@ func (r *Response) String() string {
 		return ""
 	}
 	return string(r.Body)
+}
+
+// Context returns the request context
+func (r *Response) Context() context.Context {
+	if r.Ctx != nil {
+		return r.Ctx
+	}
+	return context.Background()
+}
+
+// Cookies returns cookies from Set-Cookie headers
+func (r *Response) Cookies() []*http.Cookie {
+	if r.RawResponse != nil {
+		return r.RawResponse.Cookies()
+	}
+	// Parse from headers manually if RawResponse not captured
+	header := http.Header{"Set-Cookie": r.Headers.Values("Set-Cookie")}
+	resp := &http.Response{Header: header}
+	return resp.Cookies()
+}
+
+// Location returns the Location header URL (for redirects)
+func (r *Response) Location() string {
+	return r.Headers.Get("Location")
+}
+
+// LocationURL parses Location header as *url.URL
+func (r *Response) LocationURL() (*url.URL, error) {
+	loc := r.Headers.Get("Location")
+	if loc == "" {
+		return nil, errors.New("no Location header")
+	}
+	return url.Parse(loc)
 }
 
 // Json decodes response body using the client's JSON unmarshal function
@@ -532,6 +752,32 @@ func (r *Response) AcceptRanges() bool {
 	return r.Headers.Get("Accept-Ranges") == "bytes"
 }
 
+// IsJSON returns true if Content-Type indicates JSON
+func (r *Response) IsJSON() bool {
+	ct := r.ContentType()
+	return ct == JSON || ct == "application/json; charset=utf-8" ||
+		len(ct) > 16 && ct[:16] == "application/json"
+}
+
+// IsXML returns true if Content-Type indicates XML
+func (r *Response) IsXML() bool {
+	ct := r.ContentType()
+	return ct == XML || ct == "text/xml" ||
+		len(ct) > 15 && ct[:15] == "application/xml" ||
+		len(ct) > 8 && ct[:8] == "text/xml"
+}
+
+// IsText returns true if Content-Type indicates text
+func (r *Response) IsText() bool {
+	ct := r.ContentType()
+	return len(ct) >= 5 && ct[:5] == "text/"
+}
+
+// IsNotModified returns true if status is 304 Not Modified
+func (r *Response) IsNotModified() bool {
+	return r.StatusCode == http.StatusNotModified
+}
+
 // File represents a file for multipart upload
 // Retry notes:
 // - If Open is provided, it will be called per-attempt (supports retry).
@@ -575,10 +821,10 @@ func (cfg R) apply(r *request) {
 		r.timeout = cfg.Timeout
 	}
 	for k, v := range cfg.Headers {
-		r.headers[k] = v
+		r.ensureHeaders()[k] = v
 	}
 	for k, v := range cfg.Query {
-		r.query.Set(k, v)
+		r.ensureQuery().Set(k, v)
 	}
 	if cfg.Body != nil {
 		JSONBody(cfg.Body).apply(r)
@@ -612,10 +858,12 @@ type request struct {
 	multipart *Multipart
 
 	// retry
-	retry     int
-	retryBase time.Duration
-	retryMax  time.Duration
-	retryWhen RetryCondition
+	retry      int
+	retryBase  time.Duration
+	retryMax   time.Duration
+	retryWhen  RetryCondition
+	onRetry    func(attempt int, err error)
+	jitterType JitterType
 
 	// expectations
 	expectStatusList []int
@@ -623,6 +871,26 @@ type request struct {
 
 	// response guard
 	maxBodyBytes int64
+
+	// streaming
+	onStream    func(line []byte) error  // line-based callback (SSE/NDJSON)
+	onStreamRaw func(chunk []byte) error // raw chunk callback
+
+	// debug
+	debugWriter io.Writer
+
+	// extended options
+	rawCapture     bool   // capture RawRequest/RawResponse
+	traceEnabled   bool   // enable TraceInfo
+	rawBody        bool   // return io.ReadCloser instead of []byte
+	gzipRequest    bool   // gzip compress request body
+	decompressResp bool   // manual decompress response
+	basicUser      string // per-request basic auth
+	basicPass      string
+	hostHeader     string // override Host header
+	dumpRequest    bool   // dump full request
+	dumpResponse   bool   // dump full response
+	dumpWriter     io.Writer
 }
 
 // BodyFunc provides a repeatable body factory (retry-safe).
@@ -726,6 +994,191 @@ func MaxBodyBytes(n int64) Option {
 	return optionFunc(func(r *request) { r.maxBodyBytes = n })
 }
 
+// OnStream sets a line-based streaming callback for SSE/NDJSON.
+// Each line (without \n) is passed to the callback.
+// Return ErrStopStream to stop gracefully, or any other error to abort.
+func OnStream(fn func(line []byte) error) Option {
+	return optionFunc(func(r *request) { r.onStream = fn })
+}
+
+// OnStreamRaw sets a raw chunk streaming callback.
+// Raw chunks are passed as-is from the response body.
+// Return ErrStopStream to stop gracefully, or any other error to abort.
+func OnStreamRaw(fn func(chunk []byte) error) Option {
+	return optionFunc(func(r *request) { r.onStreamRaw = fn })
+}
+
+// Debug enables logging of request and response details.
+// Output format: --> METHOD URL \n <-- STATUS (duration)
+func Debug(w io.Writer) Option {
+	return optionFunc(func(r *request) {
+		if w == nil {
+			r.debugWriter = os.Stdout
+		} else {
+			r.debugWriter = w
+		}
+	})
+}
+
+// DebugStdout enables debug logging to stdout
+func DebugStdout() Option { return Debug(os.Stdout) }
+
+// Range sets the Range header for partial content requests.
+// Use end=-1 for "start to end of file": Range(1000, -1) -> "bytes=1000-"
+func Range(start, end int64) Option {
+	return optionFunc(func(r *request) {
+		if end < 0 {
+			r.ensureHeaders()["Range"] = fmt.Sprintf("bytes=%d-", start)
+		} else {
+			r.ensureHeaders()["Range"] = fmt.Sprintf("bytes=%d-%d", start, end)
+		}
+	})
+}
+
+// IfNoneMatch sets If-None-Match header for conditional requests (caching).
+// Server returns 304 Not Modified if ETag matches.
+func IfNoneMatch(etag string) Option {
+	return optionFunc(func(r *request) {
+		r.ensureHeaders()["If-None-Match"] = etag
+	})
+}
+
+// IfModifiedSince sets If-Modified-Since header for conditional requests.
+// Server returns 304 Not Modified if resource hasn't changed since time t.
+func IfModifiedSince(t time.Time) Option {
+	return optionFunc(func(r *request) {
+		r.ensureHeaders()["If-Modified-Since"] = t.UTC().Format(http.TimeFormat)
+	})
+}
+
+// IfMatch sets If-Match header for conditional requests (optimistic locking).
+// Server returns 412 Precondition Failed if ETag doesn't match.
+func IfMatch(etag string) Option {
+	return optionFunc(func(r *request) {
+		r.ensureHeaders()["If-Match"] = etag
+	})
+}
+
+// FormURLEncoded sets application/x-www-form-urlencoded body
+func FormURLEncoded(data map[string]string) Option {
+	return optionFunc(func(r *request) {
+		values := url.Values{}
+		for k, v := range data {
+			values.Set(k, v)
+		}
+		encoded := values.Encode()
+		r.bodyBytes = []byte(encoded)
+		r.bodyContentType = Form
+		r.bodyContentLength = int64(len(encoded))
+		r.bodyFactory = func() (io.ReadCloser, string, int64, error) {
+			return io.NopCloser(bytes.NewReader([]byte(encoded))), Form, int64(len(encoded)), nil
+		}
+		r.nonRepeatableBody = false
+	})
+}
+
+// FormURLEncodedValues sets application/x-www-form-urlencoded body from url.Values (supports multi-value)
+func FormURLEncodedValues(data url.Values) Option {
+	return optionFunc(func(r *request) {
+		encoded := data.Encode()
+		r.bodyBytes = []byte(encoded)
+		r.bodyContentType = Form
+		r.bodyContentLength = int64(len(encoded))
+		r.bodyFactory = func() (io.ReadCloser, string, int64, error) {
+			return io.NopCloser(bytes.NewReader([]byte(encoded))), Form, int64(len(encoded)), nil
+		}
+		r.nonRepeatableBody = false
+	})
+}
+
+// XMLBody sets XML body (raw bytes). Use with your preferred XML encoder.
+// Example: cio.XMLBody(xmlBytes)
+func XMLBody(data []byte) Option {
+	return optionFunc(func(r *request) {
+		r.bodyBytes = data
+		r.bodyContentType = XML
+		r.bodyContentLength = int64(len(data))
+		r.bodyFactory = func() (io.ReadCloser, string, int64, error) {
+			return io.NopCloser(bytes.NewReader(data)), XML, int64(len(data)), nil
+		}
+		r.nonRepeatableBody = false
+	})
+}
+
+// BasicAuth sets per-request basic authentication (overrides client-level)
+func BasicAuth(user, pass string) Option {
+	return optionFunc(func(r *request) {
+		r.basicUser = user
+		r.basicPass = pass
+	})
+}
+
+// HostHeader overrides the Host header
+func HostHeader(host string) Option {
+	return optionFunc(func(r *request) { r.hostHeader = host })
+}
+
+// WithRawCapture enables capturing RawRequest and RawResponse in Response
+func WithRawCapture() Option {
+	return optionFunc(func(r *request) { r.rawCapture = true })
+}
+
+// WithTrace enables detailed timing information in Response.Trace
+func WithTrace() Option {
+	return optionFunc(func(r *request) { r.traceEnabled = true })
+}
+
+// Gzip compresses the request body with gzip
+func Gzip() Option {
+	return optionFunc(func(r *request) { r.gzipRequest = true })
+}
+
+// Decompress manually decompresses gzip/deflate response (normally handled by transport)
+func Decompress() Option {
+	return optionFunc(func(r *request) { r.decompressResp = true })
+}
+
+// DumpRequest dumps the full HTTP request to the writer
+func DumpRequest(w io.Writer) Option {
+	return optionFunc(func(r *request) {
+		r.dumpRequest = true
+		r.dumpWriter = w
+	})
+}
+
+// DumpResponse dumps the full HTTP response to the writer
+func DumpResponse(w io.Writer) Option {
+	return optionFunc(func(r *request) {
+		r.dumpResponse = true
+		r.dumpWriter = w
+	})
+}
+
+// Dump dumps both request and response
+func Dump(w io.Writer) Option {
+	return optionFunc(func(r *request) {
+		r.dumpRequest = true
+		r.dumpResponse = true
+		r.dumpWriter = w
+	})
+}
+
+// WithJitter sets jitter type for retry backoff
+func WithJitter(jt JitterType) Option {
+	return optionFunc(func(r *request) { r.jitterType = jt })
+}
+
+// CacheControl sets Cache-Control header
+func CacheControl(directive string) Option {
+	return optionFunc(func(r *request) { r.ensureHeaders()["Cache-Control"] = directive })
+}
+
+// NoCache sets Cache-Control: no-cache
+func NoCache() Option { return CacheControl("no-cache") }
+
+// NoStore sets Cache-Control: no-store
+func NoStore() Option { return CacheControl("no-store") }
+
 // RetryCondition determines if request should be retried
 type RetryCondition func(resp *Response, err error) bool
 
@@ -739,6 +1192,12 @@ func Retry(count int, baseBackoffMs int, maxBackoffMs int, conditions ...RetryCo
 			r.retryWhen = conditions[0]
 		}
 	})
+}
+
+// OnRetry sets a callback that fires before each retry attempt.
+// attempt starts at 1 (first retry), err is the error from previous attempt.
+func OnRetry(fn func(attempt int, err error)) Option {
+	return optionFunc(func(r *request) { r.onRetry = fn })
 }
 
 func WhenStatus(codes ...int) RetryCondition {
@@ -795,16 +1254,16 @@ func Timeout(ms int) Option {
 
 // Query helpers (multi-value supported)
 func QuerySet(key, value string) Option {
-	return optionFunc(func(r *request) { r.query.Set(key, value) })
+	return optionFunc(func(r *request) { r.ensureQuery().Set(key, value) })
 }
 func QueryAdd(key, value string) Option {
-	return optionFunc(func(r *request) { r.query.Add(key, value) })
+	return optionFunc(func(r *request) { r.ensureQuery().Add(key, value) })
 }
 func QueryValues(v url.Values) Option {
 	return optionFunc(func(r *request) {
 		for k, vs := range v {
 			for _, x := range vs {
-				r.query.Add(k, x)
+				r.ensureQuery().Add(k, x)
 			}
 		}
 	})
@@ -823,21 +1282,21 @@ func Headers(opts ...HeaderOption) Option {
 
 func ContentType(ct string) HeaderOption {
 	return func(r *request) {
-		r.headers["Content-Type"] = ct
+		r.ensureHeaders()["Content-Type"] = ct
 		r.bodyContentType = ct
 	}
 }
 func Accept(ct string) HeaderOption {
-	return func(r *request) { r.headers["Accept"] = ct }
+	return func(r *request) { r.ensureHeaders()["Accept"] = ct }
 }
 func Header(key, value string) HeaderOption {
-	return func(r *request) { r.headers[key] = value }
+	return func(r *request) { r.ensureHeaders()[key] = value }
 }
 
 const bearerPrefix = "Bearer "
 
 func Bearer(token string) HeaderOption {
-	return func(r *request) { r.headers["Authorization"] = bearerPrefix + token }
+	return func(r *request) { r.ensureHeaders()["Authorization"] = bearerPrefix + token }
 }
 
 // HTTP methods
@@ -908,11 +1367,24 @@ func (c *Client) ParallelGet(ctx context.Context, paths []string, opts ...Option
 func (c *Client) do(ctx context.Context, method, path string, opts ...Option) (*Response, error) {
 	c.ensureHTTP()
 
-	r := getRequest()
-	defer putRequest(r)
+	r := newRequest()
 
 	for _, opt := range opts {
 		opt.apply(r)
+	}
+
+	// Rate limiting
+	if c.rateLimiter != nil {
+		if err := c.rateLimiter.Allow(ctx); err != nil {
+			return nil, fmt.Errorf("%w: %v", ErrRateLimited, err)
+		}
+	}
+
+	// Circuit breaker check
+	if c.circuitBreaker != nil {
+		if err := c.circuitBreaker.Allow(); err != nil {
+			return nil, err
+		}
 	}
 
 	// Build full URL early for error reporting
@@ -933,6 +1405,13 @@ func (c *Client) do(ctx context.Context, method, path string, opts ...Option) (*
 			return io.NopCloser(bytes.NewReader(b)), JSON, int64(len(b)), nil
 		}
 		r.nonRepeatableBody = false
+	}
+
+	// Gzip compression
+	if r.gzipRequest && r.bodyFactory != nil {
+		originalFactory := r.bodyFactory
+		r.bodyFactory = gzipBody(originalFactory)
+		r.ensureHeaders()["Content-Encoding"] = "gzip"
 	}
 
 	// attach multipart => make bodyFactory (streaming) per attempt with context awareness
@@ -957,26 +1436,53 @@ func (c *Client) do(ctx context.Context, method, path string, opts ...Option) (*
 		return nil, ErrNonRepeatable
 	}
 
+	// Start timing for metrics
+	start := time.Now()
+
 	var lastErr error
 	var lastResp *Response
 
 	for attempt := 0; attempt < maxAttempts; attempt++ {
 		if attempt > 0 {
+			// Fire onRetry callback before retry
+			if r.onRetry != nil {
+				r.onRetry(attempt, lastErr)
+			}
 			if err := sleepBackoff(ctx, attempt, r.retryBase, r.retryMax); err != nil {
 				return nil, err
 			}
 		}
 
+		// Debug: log request
+		reqStart := time.Now()
+		if r.debugWriter != nil {
+			fmt.Fprintf(r.debugWriter, "--> %s %s\n", method, fullURL)
+		}
+
 		resp, err := c.doOnce(ctx, method, fullURL, r)
 		lastResp, lastErr = resp, err
+
+		// Debug: log response
+		if r.debugWriter != nil {
+			if resp != nil {
+				fmt.Fprintf(r.debugWriter, "<-- %d %s (%v)\n", resp.StatusCode, http.StatusText(resp.StatusCode), time.Since(reqStart))
+			} else if err != nil {
+				fmt.Fprintf(r.debugWriter, "<-- ERROR: %v (%v)\n", err, time.Since(reqStart))
+			}
+		}
 
 		// ExpectStatus - now includes method and URL for debugging
 		if err == nil && resp != nil && r.expectStatusSet != nil {
 			if _, ok := r.expectStatusSet[resp.StatusCode]; !ok {
+				// Limit error body to 1KB to avoid memory bloat
+				errBody := resp.Body
+				if len(errBody) > 1024 {
+					errBody = errBody[:1024]
+				}
 				lastErr = &StatusError{
 					StatusCode: resp.StatusCode,
 					Status:     http.StatusText(resp.StatusCode),
-					Body:       resp.Body,
+					Body:       errBody,
 					Method:     method,
 					URL:        fullURL,
 				}
@@ -987,17 +1493,57 @@ func (c *Client) do(ctx context.Context, method, path string, opts ...Option) (*
 		if attempt < maxAttempts-1 {
 			if r.retryWhen != nil {
 				if r.retryWhen(resp, lastErr) {
+					// Record failure for circuit breaker
+					if c.circuitBreaker != nil {
+						c.circuitBreaker.RecordFailure()
+					}
 					continue
 				}
 			} else if lastErr != nil {
+				// Record failure for circuit breaker
+				if c.circuitBreaker != nil {
+					c.circuitBreaker.RecordFailure()
+				}
 				continue
 			}
 		}
 
+		// Record success/failure for circuit breaker
+		if c.circuitBreaker != nil {
+			if lastErr != nil || (resp != nil && resp.StatusCode >= 500) {
+				c.circuitBreaker.RecordFailure()
+			} else {
+				c.circuitBreaker.RecordSuccess()
+			}
+		}
+
+		// Fire metrics callbacks
+		c.fireMetrics(method, path, lastResp, time.Since(start), lastErr)
 		return resp, lastErr
 	}
 
+	// Record final failure for circuit breaker
+	if c.circuitBreaker != nil {
+		c.circuitBreaker.RecordFailure()
+	}
+
+	// Fire metrics callbacks for final attempt
+	c.fireMetrics(method, path, lastResp, time.Since(start), lastErr)
 	return lastResp, lastErr
+}
+
+// fireMetrics calls all registered metrics interceptors
+func (c *Client) fireMetrics(method, path string, resp *Response, duration time.Duration, err error) {
+	if len(c.onMetrics) == 0 {
+		return
+	}
+	status := 0
+	if resp != nil {
+		status = resp.StatusCode
+	}
+	for _, fn := range c.onMetrics {
+		fn(method, path, status, duration, err)
+	}
 }
 
 func sleepBackoff(ctx context.Context, attempt int, base, max time.Duration) error {
@@ -1013,8 +1559,8 @@ func sleepBackoff(ctx context.Context, attempt int, base, max time.Duration) err
 		d = max
 	}
 
-	// jitter range: [0.5..1.5)
-	j := 0.5 + jitter01()
+	// jitter range: [0.5..1.5) - mrand is thread-safe since Go 1.20
+	j := 0.5 + mrand.Float64()
 	d = time.Duration(float64(d) * j)
 
 	select {
@@ -1067,27 +1613,40 @@ func (c *Client) doOnce(ctx context.Context, method, fullURL string, r *request)
 		return nil, err
 	}
 
-	// apply defaults (client-level)
+	// apply defaults (client-level) - use direct assignment for speed
 	for k, v := range c.defaultHeaders {
-		if req.Header.Get(k) == "" {
-			req.Header.Set(k, v)
+		if _, exists := req.Header[k]; !exists {
+			req.Header[k] = []string{v}
 		}
 	}
-	if c.userAgent != "" && req.Header.Get("User-Agent") == "" {
-		req.Header.Set("User-Agent", c.userAgent)
+	if c.userAgent != "" {
+		if _, exists := req.Header["User-Agent"]; !exists {
+			req.Header["User-Agent"] = []string{c.userAgent}
+		}
 	}
-	if c.basicUser != "" {
+
+	// Basic auth: per-request overrides client-level
+	if r.basicUser != "" {
+		req.SetBasicAuth(r.basicUser, r.basicPass)
+	} else if c.basicUser != "" {
 		req.SetBasicAuth(c.basicUser, c.basicPass)
 	}
 
-	// per-request headers
+	// per-request headers (keys are already canonical from our constants)
 	for k, v := range r.headers {
-		req.Header.Set(k, v)
+		req.Header[k] = []string{v}
+	}
+
+	// Host header override
+	if r.hostHeader != "" {
+		req.Host = r.hostHeader
 	}
 
 	// content-type from bodyFactory overrides header if not set explicitly
-	if contentType != "" && req.Header.Get("Content-Type") == "" {
-		req.Header.Set("Content-Type", contentType)
+	if contentType != "" {
+		if _, exists := req.Header["Content-Type"]; !exists {
+			req.Header["Content-Type"] = []string{contentType}
+		}
 	}
 
 	// content-length for known bodies (non-multipart)
@@ -1096,11 +1655,18 @@ func (c *Client) doOnce(ctx context.Context, method, fullURL string, r *request)
 	}
 
 	if c.requestID != nil {
-		req.Header.Set("X-Request-ID", c.requestID())
+		req.Header["X-Request-Id"] = []string{c.requestID()}
 	}
 
 	for _, fn := range c.onRequest {
 		fn(req)
+	}
+
+	// Dump request
+	if r.dumpRequest && r.dumpWriter != nil {
+		dump, _ := httputil.DumpRequestOut(req, true)
+		r.dumpWriter.Write(dump)
+		r.dumpWriter.Write([]byte("\n"))
 	}
 
 	raw, err := c.http.Do(req)
@@ -1108,6 +1674,13 @@ func (c *Client) doOnce(ctx context.Context, method, fullURL string, r *request)
 		return nil, err
 	}
 	defer raw.Body.Close()
+
+	// Dump response
+	if r.dumpResponse && r.dumpWriter != nil {
+		dump, _ := httputil.DumpResponse(raw, true)
+		r.dumpWriter.Write(dump)
+		r.dumpWriter.Write([]byte("\n"))
+	}
 
 	for _, fn := range c.onResponse {
 		fn(raw)
@@ -1117,6 +1690,30 @@ func (c *Client) doOnce(ctx context.Context, method, fullURL string, r *request)
 		StatusCode: raw.StatusCode,
 		Headers:    raw.Header,
 		client:     c,
+		Ctx:        ctx,
+	}
+
+	// Capture raw request/response if requested
+	if r.rawCapture {
+		out.RawRequest = req
+		out.RawResponse = raw
+	}
+
+	// Handle streaming callbacks
+	if r.onStream != nil {
+		err := streamLines(raw.Body, r.onStream)
+		if err != nil && !errors.Is(err, ErrStopStream) {
+			return out, fmt.Errorf("stream lines: %w", err)
+		}
+		return out, nil
+	}
+
+	if r.onStreamRaw != nil {
+		err := streamRaw(raw.Body, r.onStreamRaw)
+		if err != nil && !errors.Is(err, ErrStopStream) {
+			return out, fmt.Errorf("stream raw: %w", err)
+		}
+		return out, nil
 	}
 
 	// read/copy with guard
@@ -1141,20 +1738,77 @@ func (c *Client) doOnce(ctx context.Context, method, fullURL string, r *request)
 	return out, nil
 }
 
-// copyBuffered uses pooled buffer for efficient copying
-func copyBuffered(dst io.Writer, src io.Reader) (int64, error) {
-	buf := getCopyBuf()
-	defer putCopyBuf(buf)
-	return io.CopyBuffer(dst, src, buf)
+// streamLines reads lines from reader and calls fn for each line.
+// Lines are split by \n, \r\n is handled. Empty lines are passed to fn.
+func streamLines(r io.Reader, fn func(line []byte) error) error {
+	buf := make([]byte, defaultBufferSize)
+	var lineBuf []byte
+
+	for {
+		n, err := r.Read(buf)
+		if n > 0 {
+			chunk := buf[:n]
+			for {
+				idx := bytes.IndexByte(chunk, '\n')
+				if idx < 0 {
+					lineBuf = append(lineBuf, chunk...)
+					break
+				}
+				line := chunk[:idx]
+				if len(lineBuf) > 0 {
+					lineBuf = append(lineBuf, line...)
+					line = lineBuf
+				}
+				if len(line) > 0 && line[len(line)-1] == '\r' {
+					line = line[:len(line)-1]
+				}
+				if err := fn(line); err != nil {
+					return err
+				}
+				lineBuf = lineBuf[:0]
+				chunk = chunk[idx+1:]
+			}
+		}
+		if err != nil {
+			if err == io.EOF {
+				if len(lineBuf) > 0 {
+					if err := fn(lineBuf); err != nil {
+						return err
+					}
+				}
+				return nil
+			}
+			return err
+		}
+	}
 }
 
+// streamRaw reads raw chunks from reader and calls fn for each chunk.
+func streamRaw(r io.Reader, fn func(chunk []byte) error) error {
+	buf := make([]byte, defaultBufferSize)
+	for {
+		n, err := r.Read(buf)
+		if n > 0 {
+			if err := fn(buf[:n]); err != nil {
+				return err
+			}
+		}
+		if err != nil {
+			if err == io.EOF {
+				return nil
+			}
+			return err
+		}
+	}
+}
+
+// copyWithLimit copies with optional size limit
 func copyWithLimit(dst io.Writer, src io.Reader, limit int64) (int64, error) {
 	if limit <= 0 {
-		return copyBuffered(dst, src)
+		return io.Copy(dst, src)
 	}
-	// allow one extra byte to detect overflow
 	lr := io.LimitReader(src, limit+1)
-	n, err := copyBuffered(dst, lr)
+	n, err := io.Copy(dst, lr)
 	if err != nil {
 		return n, err
 	}
@@ -1165,36 +1819,20 @@ func copyWithLimit(dst io.Writer, src io.Reader, limit int64) (int64, error) {
 }
 
 // readAllWithLimit reads response body with optional size limit.
-// Optimized to avoid double allocation when possible.
 func readAllWithLimit(r io.Reader, limit int64) ([]byte, error) {
-	buf := getBuffer()
-
 	if limit <= 0 {
-		if _, err := buf.ReadFrom(r); err != nil {
-			putBuffer(buf)
-			return nil, err
-		}
-	} else {
-		lr := io.LimitReader(r, limit+1)
-		if _, err := buf.ReadFrom(lr); err != nil {
-			putBuffer(buf)
-			return nil, err
-		}
-		if int64(buf.Len()) > limit {
-			putBuffer(buf)
-			return nil, &BodyTooLargeError{Limit: limit}
-		}
+		return io.ReadAll(r)
 	}
 
-	// Optimization: if buffer is small enough to return to pool later,
-	// we must copy. But if it's large (won't be pooled anyway), we can
-	// potentially avoid copy by taking ownership of the underlying slice.
-	// However, bytes.Buffer doesn't expose this safely, so we always copy
-	// but at least we only allocate once for the final result.
-	out := make([]byte, buf.Len())
-	copy(out, buf.Bytes())
-	putBuffer(buf)
-	return out, nil
+	lr := io.LimitReader(r, limit+1)
+	data, err := io.ReadAll(lr)
+	if err != nil {
+		return nil, err
+	}
+	if int64(len(data)) > limit {
+		return nil, &BodyTooLargeError{Limit: limit}
+	}
+	return data, nil
 }
 
 // multipart streaming (retry-safe only if sources are repeatable)
@@ -1303,14 +1941,11 @@ func buildMultipartStream(ctx context.Context, m *Multipart) (io.ReadCloser, str
 }
 
 // copyWithContext copies from src to dst with context cancellation support.
-// Uses pooled buffer for efficiency.
 func copyWithContext(ctx context.Context, dst io.Writer, src io.Reader) (int64, error) {
-	buf := getCopyBuf()
-	defer putCopyBuf(buf)
-
+	buf := make([]byte, defaultBufferSize)
 	var written int64
+
 	for {
-		// Check context periodically
 		select {
 		case <-ctx.Done():
 			return written, ctx.Err()
@@ -1344,9 +1979,17 @@ func copyWithContext(ctx context.Context, dst io.Writer, src io.Reader) (int64, 
 }
 
 func (c *Client) buildURL(path string, q url.Values) (string, error) {
-	// Parse/resolve base + path
 	var u *url.URL
-	if c.baseURL != "" {
+
+	// Use cached parsed base URL
+	if c.parsedBaseURL != nil {
+		ref, err := url.Parse(path)
+		if err != nil {
+			return "", err
+		}
+		u = c.parsedBaseURL.ResolveReference(ref)
+	} else if c.baseURL != "" {
+		// Fallback if somehow not cached
 		base, err := url.Parse(c.baseURL)
 		if err != nil {
 			return "", err
@@ -1364,17 +2007,306 @@ func (c *Client) buildURL(path string, q url.Values) (string, error) {
 		u = parsed
 	}
 
-	// Merge query (multi-values)
+	// Optimize query merging
 	if len(q) > 0 {
-		existing := u.Query()
-		for k, vs := range q {
-			// preserve multi
-			for _, v := range vs {
-				existing.Add(k, v)
+		if u.RawQuery == "" {
+			// No existing query - encode directly (skip parse)
+			u.RawQuery = q.Encode()
+		} else {
+			// Has existing query - must parse and merge
+			existing := u.Query()
+			for k, vs := range q {
+				for _, v := range vs {
+					existing.Add(k, v)
+				}
 			}
+			u.RawQuery = existing.Encode()
 		}
-		u.RawQuery = existing.Encode()
 	}
 
 	return u.String(), nil
+}
+
+// ==================== File Helpers ====================
+
+// Download downloads a file to the given path
+func (c *Client) Download(ctx context.Context, urlPath, filePath string, opts ...Option) (*Response, error) {
+	f, err := os.Create(filePath)
+	if err != nil {
+		return nil, fmt.Errorf("create file: %w", err)
+	}
+	defer f.Close()
+
+	opts = append(opts, OutputStream(f))
+	resp, err := c.Get(ctx, urlPath, opts...)
+	if err != nil {
+		os.Remove(filePath) // cleanup on error
+		return nil, err
+	}
+	if !resp.OK() {
+		os.Remove(filePath)
+		return resp, fmt.Errorf("download failed: status %d", resp.StatusCode)
+	}
+	return resp, nil
+}
+
+// Upload uploads a file from the given path
+func (c *Client) Upload(ctx context.Context, urlPath, filePath, fieldName string, opts ...Option) (*Response, error) {
+	f, err := os.Open(filePath)
+	if err != nil {
+		return nil, fmt.Errorf("open file: %w", err)
+	}
+
+	stat, err := f.Stat()
+	if err != nil {
+		f.Close()
+		return nil, fmt.Errorf("stat file: %w", err)
+	}
+
+	file := File{
+		Name: fieldName,
+		Path: filepath.Base(filePath),
+		Open: func() (io.ReadCloser, error) {
+			return os.Open(filePath)
+		},
+		Size: stat.Size(),
+	}
+	f.Close()
+
+	opts = append(opts, Files(file))
+	return c.Post(ctx, urlPath, opts...)
+}
+
+// ==================== Testing Helpers ====================
+
+// MockResponse represents a mock HTTP response for testing
+type MockResponse struct {
+	StatusCode int
+	Headers    http.Header
+	Body       []byte
+	Error      error
+}
+
+// MockTransport implements http.RoundTripper for testing
+type MockTransport struct {
+	mu        sync.Mutex
+	responses map[string]MockResponse // key: "METHOD URL"
+	defaultFn func(*http.Request) (*http.Response, error)
+	calls     []MockCall
+}
+
+// MockCall records a request made to MockTransport
+type MockCall struct {
+	Method string
+	URL    string
+	Header http.Header
+	Body   []byte
+}
+
+// NewMockTransport creates a new mock transport
+func NewMockTransport() *MockTransport {
+	return &MockTransport{
+		responses: make(map[string]MockResponse),
+	}
+}
+
+// On registers a mock response for a method and URL pattern
+func (m *MockTransport) On(method, urlPattern string, resp MockResponse) *MockTransport {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	m.responses[method+" "+urlPattern] = resp
+	return m
+}
+
+// OnAny registers a default handler for unmatched requests
+func (m *MockTransport) OnAny(fn func(*http.Request) (*http.Response, error)) *MockTransport {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	m.defaultFn = fn
+	return m
+}
+
+// Calls returns all recorded calls
+func (m *MockTransport) Calls() []MockCall {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	return append([]MockCall{}, m.calls...)
+}
+
+// Reset clears all recorded calls
+func (m *MockTransport) Reset() {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	m.calls = m.calls[:0]
+}
+
+// RoundTrip implements http.RoundTripper
+func (m *MockTransport) RoundTrip(req *http.Request) (*http.Response, error) {
+	m.mu.Lock()
+
+	// Record call
+	var bodyBytes []byte
+	if req.Body != nil {
+		bodyBytes, _ = io.ReadAll(req.Body)
+		req.Body.Close()
+		req.Body = io.NopCloser(bytes.NewReader(bodyBytes))
+	}
+	m.calls = append(m.calls, MockCall{
+		Method: req.Method,
+		URL:    req.URL.String(),
+		Header: req.Header.Clone(),
+		Body:   bodyBytes,
+	})
+
+	key := req.Method + " " + req.URL.String()
+	resp, ok := m.responses[key]
+	if !ok {
+		// Try without query string
+		key = req.Method + " " + req.URL.Path
+		resp, ok = m.responses[key]
+	}
+	defaultFn := m.defaultFn
+	m.mu.Unlock()
+
+	if !ok {
+		if defaultFn != nil {
+			return defaultFn(req)
+		}
+		return nil, fmt.Errorf("no mock response for %s %s", req.Method, req.URL)
+	}
+
+	if resp.Error != nil {
+		return nil, resp.Error
+	}
+
+	headers := resp.Headers
+	if headers == nil {
+		headers = make(http.Header)
+	}
+
+	return &http.Response{
+		StatusCode: resp.StatusCode,
+		Status:     http.StatusText(resp.StatusCode),
+		Header:     headers,
+		Body:       io.NopCloser(bytes.NewReader(resp.Body)),
+		Request:    req,
+	}, nil
+}
+
+// RecordTransport wraps a transport and records all requests/responses
+type RecordTransport struct {
+	Transport http.RoundTripper
+	mu        sync.Mutex
+	records   []Record
+}
+
+// Record represents a recorded request/response pair
+type Record struct {
+	Request   *http.Request
+	Response  *http.Response
+	ReqBody   []byte
+	RespBody  []byte
+	Error     error
+	Duration  time.Duration
+	StartTime time.Time
+}
+
+// NewRecordTransport creates a recording transport wrapper
+func NewRecordTransport(transport http.RoundTripper) *RecordTransport {
+	if transport == nil {
+		transport = http.DefaultTransport
+	}
+	return &RecordTransport{Transport: transport}
+}
+
+// RoundTrip implements http.RoundTripper
+func (rt *RecordTransport) RoundTrip(req *http.Request) (*http.Response, error) {
+	start := time.Now()
+
+	// Read request body
+	var reqBody []byte
+	if req.Body != nil {
+		reqBody, _ = io.ReadAll(req.Body)
+		req.Body.Close()
+		req.Body = io.NopCloser(bytes.NewReader(reqBody))
+	}
+
+	resp, err := rt.Transport.RoundTrip(req)
+
+	record := Record{
+		Request:   req,
+		ReqBody:   reqBody,
+		Error:     err,
+		Duration:  time.Since(start),
+		StartTime: start,
+	}
+
+	if resp != nil {
+		// Read and restore response body
+		respBody, _ := io.ReadAll(resp.Body)
+		resp.Body.Close()
+		resp.Body = io.NopCloser(bytes.NewReader(respBody))
+
+		record.Response = resp
+		record.RespBody = respBody
+	}
+
+	rt.mu.Lock()
+	rt.records = append(rt.records, record)
+	rt.mu.Unlock()
+
+	return resp, err
+}
+
+// Records returns all recorded request/response pairs
+func (rt *RecordTransport) Records() []Record {
+	rt.mu.Lock()
+	defer rt.mu.Unlock()
+	return append([]Record{}, rt.records...)
+}
+
+// Reset clears all records
+func (rt *RecordTransport) Reset() {
+	rt.mu.Lock()
+	defer rt.mu.Unlock()
+	rt.records = rt.records[:0]
+}
+
+// ==================== Gzip Helpers ====================
+
+// gzipBody wraps a body factory with gzip compression
+func gzipBody(factory func() (io.ReadCloser, string, int64, error)) func() (io.ReadCloser, string, int64, error) {
+	return func() (io.ReadCloser, string, int64, error) {
+		rc, ct, _, err := factory()
+		if err != nil {
+			return nil, "", -1, err
+		}
+
+		pr, pw := io.Pipe()
+		gz := gzip.NewWriter(pw)
+
+		go func() {
+			defer rc.Close()
+
+			if _, err := io.Copy(gz, rc); err != nil {
+				_ = gz.Close()
+				_ = pw.CloseWithError(err)
+				return
+			}
+
+			if err := gz.Close(); err != nil {
+				_ = pw.CloseWithError(err)
+				return
+			}
+
+			_ = pw.Close()
+		}()
+
+		return pr, ct, -1, nil
+	}
+}
+
+// decompressReader wraps a reader to decompress gzip
+func decompressReader(r io.Reader) (io.ReadCloser, error) {
+	return gzip.NewReader(r)
 }
