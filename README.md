@@ -22,7 +22,6 @@ go get github.com/dreamph/cio
 - **Request Tracing** - Built-in request ID and distributed tracing support
 - **Timeout** - Per-request and client-level timeout
 - **Status Validation** - Auto error on unexpected status codes
-- **Compression** - Gzip request/response support
 - **Debug & Dump** - Request/response debugging and dumping
 - **Caching** - HTTP cache control headers
 - **Range Requests** - Partial content support
@@ -449,7 +448,7 @@ fmt.Printf("DNS: %v, Connect: %v, TLS: %v, Total: %v\n",
 ```go
 // Cache control
 resp, _ := c.Get(ctx, "/api", cio.DisableCache())
-resp, _ := c.Get(ctx, "/api", cio.NoStore())
+resp, _ := c.Get(ctx, "/api", cio.CacheControl("no-store"))
 resp, _ := c.Get(ctx, "/api", cio.CacheControl("max-age=3600"))
 
 // Conditional requests with ETag
@@ -492,21 +491,6 @@ resp, _ := c.Get(ctx, "/file", cio.Range(1024, -1)) // From byte 1024 to end
 if resp.AcceptRanges() {
     // Server supports range requests
 }
-```
-
-### Compression
-
-```go
-// Gzip request body
-resp, _ := c.Post(ctx, "/api",
-    cio.JSONBody(largeData),
-    cio.Gzip(),
-)
-
-// Manual response decompression
-resp, _ := c.Get(ctx, "/compressed",
-    cio.Decompress(),
-)
 ```
 
 ### Debug & Dump
