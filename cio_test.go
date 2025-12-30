@@ -1088,6 +1088,7 @@ func TestNoCacheAndNoStore(t *testing.T) {
 	ctx := context.Background()
 
 	c.Get(ctx, "/a", DisableCache())
+	c.Get(ctx, "/b", CacheControl("no-store"))
 
 	calls := mt.Calls()
 	if calls[0].Header.Get("Cache-Control") != "no-cache" {
@@ -1609,6 +1610,28 @@ func TestOutputStreamWithMaxBodyBytes(t *testing.T) {
 
 	if err == nil {
 		t.Fatalf("expected error for body too large")
+	}
+}
+
+/* ========== Gzip Request/Response ========== */
+
+func TestGzipRequestOption(t *testing.T) {
+	mt := NewMockTransport()
+	mt.On("POST", "https://api.test/data", MockResponse{StatusCode: 200})
+
+	c := New(HTTPClient(&http.Client{Transport: mt}), BaseURL("https://api.test"))
+	ctx := context.Background()
+	// Use larger data to ensure compression
+	largeData := bytes.Repeat([]byte("test data "), 100)
+	c.Post(ctx, "/data", BodyBytes(largeData), Gzip())
+
+	calls := mt.Calls()
+	if calls[0].Header.Get("Content-Encoding") != "gzip" {
+		t.Fatalf("Content-Encoding should be gzip")
+	}
+	// With gzip, compressed data should be smaller than original for repetitive data
+	if len(calls[0].Body) >= len(largeData) {
+		t.Fatalf("body should be compressed: got %d bytes, original %d bytes", len(calls[0].Body), len(largeData))
 	}
 }
 

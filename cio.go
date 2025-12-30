@@ -28,18 +28,6 @@ import (
 	"time"
 )
 
-var (
-	jitterRandMu sync.Mutex
-	jitterRand   = mrand.New(mrand.NewSource(time.Now().UnixNano()))
-)
-
-func jitterFloat64() float64 {
-	jitterRandMu.Lock()
-	v := jitterRand.Float64()
-	jitterRandMu.Unlock()
-	return v
-}
-
 // Content types
 const (
 	JSON          = "application/json"
@@ -89,6 +77,19 @@ const (
 	defaultBufferSize = 32 * 1024
 )
 
+// global jitter RNG (แทนการใช้ mrand.Seed ที่ deprecated)
+var (
+	jitterRandMu sync.Mutex
+	jitterRand   = mrand.New(mrand.NewSource(time.Now().UnixNano()))
+)
+
+func jitterFloat64() float64 {
+	jitterRandMu.Lock()
+	v := jitterRand.Float64()
+	jitterRandMu.Unlock()
+	return v
+}
+
 func newRequest() *request {
 	return &request{
 		bodyContentLength: -1,
@@ -113,12 +114,13 @@ func (r *request) ensureQuery() url.Values {
 
 // Errors
 var (
-	ErrNoCookieJar   = errors.New("cookie jar not enabled, use WithCookieJar()")
-	ErrBodyTooLarge  = errors.New("response body exceeds MaxBodyBytes")
-	ErrNonRepeatable = errors.New("request body is non-repeatable; retry is not supported without BodyFunc/seekable body")
-	ErrStopStream    = errors.New("stop stream") // graceful stop for OnStream/OnStreamRaw
-	ErrRateLimited   = errors.New("rate limit exceeded")
-	ErrCircuitOpen   = errors.New("circuit breaker is open")
+	ErrUnexpectedStatus = errors.New("unexpected status code")
+	ErrNoCookieJar      = errors.New("cookie jar not enabled, use WithCookieJar()")
+	ErrBodyTooLarge     = errors.New("response body exceeds MaxBodyBytes")
+	ErrNonRepeatable    = errors.New("request body is non-repeatable; retry is not supported without BodyFunc/seekable body")
+	ErrStopStream       = errors.New("stop stream") // graceful stop for OnStream/OnStreamRaw
+	ErrRateLimited      = errors.New("rate limit exceeded")
+	ErrCircuitOpen      = errors.New("circuit breaker is open")
 )
 
 // JitterType determines jitter strategy for retries
@@ -127,7 +129,7 @@ type JitterType int
 const (
 	JitterFull         JitterType = iota // Full jitter: [0, backoff)
 	JitterEqual                          // Equal jitter: backoff/2 + [0, backoff/2)
-	JitterDecorrelated                   // Decorrelated: approx [base, prev*2] (approximation)
+	JitterDecorrelated                   // Decorrelated: [base, prev * 3)
 )
 
 // RateLimiter implements token bucket rate limiting
@@ -901,7 +903,8 @@ type request struct {
 	jitterType JitterType
 
 	// expectations
-	expectStatusSet map[int]struct{}
+	expectStatusList []int
+	expectStatusSet  map[int]struct{}
 
 	// response guard
 	maxBodyBytes int64
@@ -916,6 +919,8 @@ type request struct {
 	// extended options
 	rawCapture     bool   // capture RawRequest/RawResponse
 	traceEnabled   bool   // enable TraceInfo
+	rawBody        bool   // return io.ReadCloser instead of []byte
+	gzipRequest    bool   // gzip compress request body
 	decompressResp bool   // manual decompress response
 	basicUser      string // per-request basic auth
 	basicPass      string
@@ -934,25 +939,11 @@ func BodyFunc(fn func() (io.ReadCloser, string, int64, error)) Option {
 }
 
 // BodyBytes sets pre-encoded body bytes (retry-safe).
-// NOTE: Content-Type must be set separately (e.g. via Headers(ContentType(...))).
 func BodyBytes(data []byte) Option {
 	return optionFunc(func(r *request) {
 		r.bodyBytes = data
 		r.bodyFactory = func() (io.ReadCloser, string, int64, error) {
 			return io.NopCloser(bytes.NewReader(data)), r.bodyContentType, int64(len(data)), nil
-		}
-		r.nonRepeatableBody = false
-	})
-}
-
-// BodyBytesWithType sets body bytes and Content-Type explicitly (retry-safe).
-func BodyBytesWithType(data []byte, ct string) Option {
-	return optionFunc(func(r *request) {
-		r.bodyBytes = data
-		r.bodyContentType = ct
-		r.bodyContentLength = int64(len(data))
-		r.bodyFactory = func() (io.ReadCloser, string, int64, error) {
-			return io.NopCloser(bytes.NewReader(data)), ct, int64(len(data)), nil
 		}
 		r.nonRepeatableBody = false
 	})
@@ -1178,6 +1169,11 @@ func WithTrace() Option {
 	return optionFunc(func(r *request) { r.traceEnabled = true })
 }
 
+// Gzip compresses the request body with gzip
+func Gzip() Option {
+	return optionFunc(func(r *request) { r.gzipRequest = true })
+}
+
 // Decompress manually decompresses gzip/deflate response (normally handled by transport)
 func Decompress() Option {
 	return optionFunc(func(r *request) { r.decompressResp = true })
@@ -1276,6 +1272,7 @@ func When(fn func(resp *Response, err error) bool) RetryCondition { return fn }
 // ExpectStatus sets expected status codes (O(1))
 func ExpectStatus(codes ...int) Option {
 	return optionFunc(func(r *request) {
+		r.expectStatusList = append(r.expectStatusList[:0], codes...)
 		r.expectStatusSet = make(map[int]struct{}, len(codes))
 		for _, c := range codes {
 			r.expectStatusSet[c] = struct{}{}
@@ -1461,9 +1458,10 @@ func (c *Client) do(ctx context.Context, method, path string, opts ...Option) (*
 	}
 
 	// Gzip compression (wrap bodyFactory ที่สร้างเสร็จแล้ว)
-	if r.bodyFactory != nil {
-		// caller can enable gzip via header/content-type; gzipBody wraps any existing factory
-		// if you want toggle: ใช้ Header("Content-Encoding", "gzip") คู่กับ gzipBody ภายนอก
+	if r.gzipRequest && r.bodyFactory != nil {
+		originalFactory := r.bodyFactory
+		r.bodyFactory = gzipBody(originalFactory)
+		r.ensureHeaders()["Content-Encoding"] = "gzip"
 	}
 
 	maxAttempts := r.retry + 1
@@ -1484,7 +1482,7 @@ func (c *Client) do(ctx context.Context, method, path string, opts ...Option) (*
 
 	for attempt := 0; attempt < maxAttempts; attempt++ {
 		if attempt > 0 {
-			// Fire onRetry callback before retry (attempt starts at 1 for first retry)
+			// Fire onRetry callback before retry
 			if r.onRetry != nil {
 				r.onRetry(attempt, lastErr)
 			}
@@ -1586,13 +1584,10 @@ func (c *Client) fireMetrics(method, path string, resp *Response, duration time.
 	}
 }
 
-// sleepBackoff applies exponential backoff with jitter according to JitterType.
-// attempt starts at 1 for the first retry.
 func sleepBackoff(ctx context.Context, attempt int, base, max time.Duration, jt JitterType) error {
 	if base <= 0 || attempt <= 0 {
 		return nil
 	}
-
 	// exponential: base * 2^(attempt-1)
 	exp := float64(base) * math.Pow(2, float64(attempt-1))
 	d := time.Duration(exp)
@@ -1608,7 +1603,7 @@ func sleepBackoff(ctx context.Context, attempt int, base, max time.Duration, jt 
 		half := float64(d) / 2
 		d = time.Duration(half + jitterFloat64()*half)
 	case JitterDecorrelated:
-		// approx decorrelated: random between base and d
+		// decorrelated: random between base and d
 		lo := float64(base)
 		hi := float64(d)
 		if hi < lo {
@@ -2056,7 +2051,7 @@ func buildMultipartStream(ctx context.Context, m *Multipart) (io.ReadCloser, str
 		}
 	}()
 
-	// content length unknown for streamed multipart (chunked)
+	// content length unknown for streamed multipart
 	return pr, w.FormDataContentType(), -1, nil
 }
 
@@ -2260,7 +2255,7 @@ func (m *MockTransport) Reset() {
 func (m *MockTransport) RoundTrip(req *http.Request) (*http.Response, error) {
 	m.mu.Lock()
 
-	// Record call (full body copy; careful with huge payloads)
+	// Record call
 	var bodyBytes []byte
 	if req.Body != nil {
 		bodyBytes, _ = io.ReadAll(req.Body)
@@ -2339,7 +2334,7 @@ func NewRecordTransport(transport http.RoundTripper) *RecordTransport {
 func (rt *RecordTransport) RoundTrip(req *http.Request) (*http.Response, error) {
 	start := time.Now()
 
-	// Read request body (full copy; careful with huge payloads)
+	// Read request body
 	var reqBody []byte
 	if req.Body != nil {
 		reqBody, _ = io.ReadAll(req.Body)
@@ -2420,7 +2415,6 @@ func gzipBody(factory func() (io.ReadCloser, string, int64, error)) func() (io.R
 			_ = pw.Close()
 		}()
 
-		// content-length unknown; HTTP client will use chunked encoding
 		return pr, ct, -1, nil
 	}
 }
