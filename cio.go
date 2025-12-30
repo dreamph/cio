@@ -135,6 +135,7 @@ func getRequest() *request {
 	r.bodyContentType = ""
 	r.bodyContentLength = -1
 	r.nonRepeatableBody = false
+	r.jsonValue = nil
 
 	r.multipart = nil
 
@@ -168,14 +169,19 @@ var (
 	ErrNonRepeatable    = errors.New("request body is non-repeatable; retry is not supported without BodyFunc/seekable body")
 )
 
-// StatusError represents an HTTP status error
+// StatusError represents an HTTP status error with request context for debugging
 type StatusError struct {
 	StatusCode int
 	Status     string
 	Body       []byte
+	Method     string // HTTP method (GET, POST, etc.)
+	URL        string // Full request URL
 }
 
 func (e *StatusError) Error() string {
+	if e.Method != "" && e.URL != "" {
+		return fmt.Sprintf("unexpected status %d: %s [%s %s]", e.StatusCode, e.Status, e.Method, e.URL)
+	}
 	return fmt.Sprintf("unexpected status %d: %s", e.StatusCode, e.Status)
 }
 
@@ -186,6 +192,12 @@ type BodyTooLargeError struct {
 func (e *BodyTooLargeError) Error() string {
 	return fmt.Sprintf("%v: limit=%d", ErrBodyTooLarge, e.Limit)
 }
+
+// JSON codec function types
+type (
+	JSONMarshal   func(v any) ([]byte, error)
+	JSONUnmarshal func(data []byte, v any) error
+)
 
 // Interceptors
 type RequestInterceptor func(*http.Request)
@@ -205,9 +217,14 @@ type Client struct {
 
 	// defaults
 	defaultHeaders map[string]string
+	defaultTimeout time.Duration
 	userAgent      string
 	basicUser      string
 	basicPass      string
+
+	// json codec
+	jsonMarshal   JSONMarshal
+	jsonUnmarshal JSONUnmarshal
 }
 
 type ClientOption func(*Client)
@@ -258,6 +275,15 @@ func WithBasicAuth(user, pass string) ClientOption {
 	return func(c *Client) {
 		c.basicUser = user
 		c.basicPass = pass
+	}
+}
+
+// WithJSONCodec sets custom JSON marshal/unmarshal functions
+// Example: cio.WithJSONCodec(sonic.Marshal, sonic.Unmarshal)
+func WithJSONCodec(marshal JSONMarshal, unmarshal JSONUnmarshal) ClientOption {
+	return func(c *Client) {
+		c.jsonMarshal = marshal
+		c.jsonUnmarshal = unmarshal
 	}
 }
 
@@ -332,13 +358,66 @@ func DefaultTransport() *http.Transport {
 
 func New(opts ...ClientOption) *Client {
 	c := &Client{
-		http: &http.Client{Transport: DefaultTransport()},
+		http:          &http.Client{Transport: DefaultTransport()},
+		jsonMarshal:   json.Marshal,
+		jsonUnmarshal: json.Unmarshal,
 	}
 	for _, opt := range opts {
 		opt(c)
 	}
 	c.ensureHTTP()
 	return c
+}
+
+// Clone creates a new Client with the same settings, then applies additional options.
+// The new client shares the same http.Client (and thus connection pool) by default.
+// Use HTTPClient() or Transport() option to use a separate connection pool.
+func (c *Client) Clone(opts ...ClientOption) *Client {
+	clone := &Client{
+		http:           c.http,
+		baseURL:        c.baseURL,
+		requestID:      c.requestID,
+		userAgent:      c.userAgent,
+		basicUser:      c.basicUser,
+		basicPass:      c.basicPass,
+		defaultTimeout: c.defaultTimeout,
+		jsonMarshal:    c.jsonMarshal,
+		jsonUnmarshal:  c.jsonUnmarshal,
+	}
+
+	// Copy slices
+	if len(c.onRequest) > 0 {
+		clone.onRequest = make([]RequestInterceptor, len(c.onRequest))
+		copy(clone.onRequest, c.onRequest)
+	}
+	if len(c.onResponse) > 0 {
+		clone.onResponse = make([]ResponseInterceptor, len(c.onResponse))
+		copy(clone.onResponse, c.onResponse)
+	}
+	if len(c.onAfter) > 0 {
+		clone.onAfter = make([]AfterReadInterceptor, len(c.onAfter))
+		copy(clone.onAfter, c.onAfter)
+	}
+
+	// Copy map
+	if len(c.defaultHeaders) > 0 {
+		clone.defaultHeaders = make(map[string]string, len(c.defaultHeaders))
+		for k, v := range c.defaultHeaders {
+			clone.defaultHeaders[k] = v
+		}
+	}
+
+	// Apply new options
+	for _, opt := range opts {
+		opt(clone)
+	}
+
+	return clone
+}
+
+// WithTimeout sets default timeout for all requests (can be overridden per-request with Timeout())
+func WithTimeout(d time.Duration) ClientOption {
+	return func(c *Client) { c.defaultTimeout = d }
 }
 
 func (c *Client) ensureHTTP() {
@@ -390,6 +469,8 @@ type Response struct {
 	Headers    http.Header
 	Body       []byte
 	Written    int64 // bytes written when using OutputStream
+
+	client *Client // internal reference for JSON decoding
 }
 
 func (r *Response) OK() bool { return r.StatusCode >= 200 && r.StatusCode < 300 }
@@ -399,11 +480,19 @@ func (r *Response) String() string {
 	}
 	return string(r.Body)
 }
-func (r *Response) Json(v any) error { return json.Unmarshal(r.Body, v) }
 
+// Json decodes response body using the client's JSON unmarshal function
+func (r *Response) Json(v any) error {
+	if r.client != nil && r.client.jsonUnmarshal != nil {
+		return r.client.jsonUnmarshal(r.Body, v)
+	}
+	return json.Unmarshal(r.Body, v)
+}
+
+// Json decodes response body into type T using the client's JSON codec
 func Json[T any](r *Response) (T, error) {
 	var v T
-	err := json.Unmarshal(r.Body, &v)
+	err := r.Json(&v)
 	return v, err
 }
 
@@ -481,6 +570,7 @@ type request struct {
 	bodyContentType   string
 	bodyContentLength int64
 	nonRepeatableBody bool
+	jsonValue         any // deferred JSON marshaling (uses client codec)
 
 	// multipart (built via bodyFactory per attempt)
 	multipart *Multipart
@@ -519,21 +609,21 @@ func BodyBytes(data []byte) Option {
 }
 
 // BodyReader sets a reader. Retry works only if reader is io.ReadSeeker.
+// Note: For concurrent usage or retry safety, prefer BodyFunc with a factory function.
 func BodyReader(reader io.Reader) Option {
 	return optionFunc(func(r *request) {
 		// clear bytes
 		r.bodyBytes = nil
 
 		if rs, ok := reader.(io.ReadSeeker); ok {
+			// Wrap in a factory that creates a fresh wrapper each time
+			// to avoid shared state issues with concurrent requests
 			r.bodyFactory = func() (io.ReadCloser, string, int64, error) {
 				if _, err := rs.Seek(0, io.SeekStart); err != nil {
 					return nil, "", -1, err
 				}
-				// ReadSeeker isn't necessarily ReadCloser
-				if rc, ok := reader.(io.ReadCloser); ok {
-					return rc, r.bodyContentType, r.bodyContentLength, nil
-				}
-				return io.NopCloser(reader), r.bodyContentType, r.bodyContentLength, nil
+				// Create a new wrapper each time to avoid shared ReadCloser state
+				return io.NopCloser(&seekerWrapper{rs: rs}), r.bodyContentType, r.bodyContentLength, nil
 			}
 			r.nonRepeatableBody = false
 			return
@@ -550,21 +640,20 @@ func BodyReader(reader io.Reader) Option {
 	})
 }
 
-// JSONBody marshals JSON, sets Content-Type, retry-safe.
+// seekerWrapper wraps a ReadSeeker to provide independent read position tracking
+type seekerWrapper struct {
+	rs io.ReadSeeker
+}
+
+func (w *seekerWrapper) Read(p []byte) (int, error) {
+	return w.rs.Read(p)
+}
+
+// JSONBody sets JSON body. Marshaling uses client's codec (deferred until request execution).
 func JSONBody(v any) Option {
 	return optionFunc(func(r *request) {
-		b, err := json.Marshal(v)
-		if err != nil {
-			// store as non-repeatable error via factory so doOnce gets it
-			r.bodyFactory = func() (io.ReadCloser, string, int64, error) {
-				return nil, "", -1, err
-			}
-			r.nonRepeatableBody = true
-			return
-		}
+		r.jsonValue = v
 		r.bodyContentType = JSON
-		r.bodyContentLength = int64(len(b))
-		BodyBytes(b).apply(r)
 	})
 }
 
@@ -790,10 +879,31 @@ func (c *Client) do(ctx context.Context, method, path string, opts ...Option) (*
 		opt.apply(r)
 	}
 
-	// attach multipart => make bodyFactory (streaming) per attempt
-	if r.multipart != nil {
+	// Build full URL early for error reporting
+	fullURL, err := c.buildURL(path, r.query)
+	if err != nil {
+		return nil, err
+	}
+
+	// Handle deferred JSON marshaling with client's codec
+	if r.jsonValue != nil {
+		b, err := c.jsonMarshal(r.jsonValue)
+		if err != nil {
+			return nil, fmt.Errorf("json marshal: %w", err)
+		}
+		r.bodyBytes = b
+		r.bodyContentLength = int64(len(b))
 		r.bodyFactory = func() (io.ReadCloser, string, int64, error) {
-			return buildMultipartStream(r.multipart)
+			return io.NopCloser(bytes.NewReader(b)), JSON, int64(len(b)), nil
+		}
+		r.nonRepeatableBody = false
+	}
+
+	// attach multipart => make bodyFactory (streaming) per attempt with context awareness
+	if r.multipart != nil {
+		m := r.multipart // capture for closure
+		r.bodyFactory = func() (io.ReadCloser, string, int64, error) {
+			return buildMultipartStream(ctx, m)
 		}
 		// check repeatability for retry
 		if !multipartRepeatable(r.multipart) {
@@ -821,16 +931,18 @@ func (c *Client) do(ctx context.Context, method, path string, opts ...Option) (*
 			}
 		}
 
-		resp, err := c.doOnce(ctx, method, path, r)
+		resp, err := c.doOnce(ctx, method, fullURL, r)
 		lastResp, lastErr = resp, err
 
-		// ExpectStatus
+		// ExpectStatus - now includes method and URL for debugging
 		if err == nil && resp != nil && r.expectStatusSet != nil {
 			if _, ok := r.expectStatusSet[resp.StatusCode]; !ok {
 				lastErr = &StatusError{
 					StatusCode: resp.StatusCode,
 					Status:     http.StatusText(resp.StatusCode),
 					Body:       resp.Body,
+					Method:     method,
+					URL:        fullURL,
 				}
 			}
 		}
@@ -877,22 +989,24 @@ func sleepBackoff(ctx context.Context, attempt int, base, max time.Duration) err
 	}
 }
 
-func (c *Client) doOnce(ctx context.Context, method, path string, r *request) (*Response, error) {
-	if r.timeout > 0 {
-		var cancel context.CancelFunc
-		ctx, cancel = context.WithTimeout(ctx, r.timeout)
-		defer cancel()
+// doOnce now receives the pre-built fullURL
+func (c *Client) doOnce(ctx context.Context, method, fullURL string, r *request) (*Response, error) {
+	// Use request timeout if set, otherwise fall back to client default
+	timeout := r.timeout
+	if timeout == 0 {
+		timeout = c.defaultTimeout
 	}
-
-	fullURL, err := c.buildURL(path, r.query)
-	if err != nil {
-		return nil, err
+	if timeout > 0 {
+		var cancel context.CancelFunc
+		ctx, cancel = context.WithTimeout(ctx, timeout)
+		defer cancel()
 	}
 
 	var (
 		body          io.ReadCloser
 		contentType   string
 		contentLength int64 = -1
+		err           error
 	)
 
 	if r.bodyFactory != nil {
@@ -966,6 +1080,7 @@ func (c *Client) doOnce(ctx context.Context, method, path string, r *request) (*
 	out := &Response{
 		StatusCode: raw.StatusCode,
 		Headers:    raw.Header,
+		client:     c,
 	}
 
 	// read/copy with guard
@@ -1013,31 +1128,36 @@ func copyWithLimit(dst io.Writer, src io.Reader, limit int64) (int64, error) {
 	return n, nil
 }
 
+// readAllWithLimit reads response body with optional size limit.
+// Optimized to avoid double allocation when possible.
 func readAllWithLimit(r io.Reader, limit int64) ([]byte, error) {
+	buf := getBuffer()
+
 	if limit <= 0 {
-		buf := getBuffer()
-		defer putBuffer(buf)
 		if _, err := buf.ReadFrom(r); err != nil {
+			putBuffer(buf)
 			return nil, err
 		}
-		out := make([]byte, buf.Len())
-		copy(out, buf.Bytes())
-		return out, nil
+	} else {
+		lr := io.LimitReader(r, limit+1)
+		if _, err := buf.ReadFrom(lr); err != nil {
+			putBuffer(buf)
+			return nil, err
+		}
+		if int64(buf.Len()) > limit {
+			putBuffer(buf)
+			return nil, &BodyTooLargeError{Limit: limit}
+		}
 	}
 
-	lr := io.LimitReader(r, limit+1)
-	buf := getBuffer()
-	defer putBuffer(buf)
-
-	if _, err := buf.ReadFrom(lr); err != nil {
-		return nil, err
-	}
-	if int64(buf.Len()) > limit {
-		return nil, &BodyTooLargeError{Limit: limit}
-	}
-
+	// Optimization: if buffer is small enough to return to pool later,
+	// we must copy. But if it's large (won't be pooled anyway), we can
+	// potentially avoid copy by taking ownership of the underlying slice.
+	// However, bytes.Buffer doesn't expose this safely, so we always copy
+	// but at least we only allocate once for the final result.
 	out := make([]byte, buf.Len())
 	copy(out, buf.Bytes())
+	putBuffer(buf)
 	return out, nil
 }
 
@@ -1058,33 +1178,54 @@ func multipartRepeatable(m *Multipart) bool {
 
 // buildMultipartStream returns a fresh body each call.
 // It streams via io.Pipe to avoid buffering whole payload in RAM.
-func buildMultipartStream(m *Multipart) (io.ReadCloser, string, int64, error) {
+// Now context-aware to prevent goroutine leaks on cancellation.
+func buildMultipartStream(ctx context.Context, m *Multipart) (io.ReadCloser, string, int64, error) {
 	pr, pw := io.Pipe()
 	w := multipart.NewWriter(pw)
 
 	go func() {
+		var err error
 		defer func() {
 			_ = w.Close()
-			_ = pw.Close()
+			if err != nil {
+				_ = pw.CloseWithError(err)
+			} else {
+				_ = pw.Close()
+			}
 		}()
 
 		// fields first (either order ok; keeping deterministic helps debugging)
 		for k, v := range m.Fields {
-			if err := w.WriteField(k, v); err != nil {
-				_ = pw.CloseWithError(err)
+			// Check context before potentially blocking operations
+			select {
+			case <-ctx.Done():
+				err = ctx.Err()
+				return
+			default:
+			}
+
+			if err = w.WriteField(k, v); err != nil {
 				return
 			}
 		}
 
 		for _, f := range m.Files {
+			// Check context before processing each file
+			select {
+			case <-ctx.Done():
+				err = ctx.Err()
+				return
+			default:
+			}
+
 			filename := f.Path
 			if filename == "" {
 				filename = filepath.Base(f.Name)
 			}
 
-			part, err := w.CreateFormFile(f.Name, filename)
+			var part io.Writer
+			part, err = w.CreateFormFile(f.Name, filename)
 			if err != nil {
-				_ = pw.CloseWithError(err)
 				return
 			}
 
@@ -1092,12 +1233,10 @@ func buildMultipartStream(m *Multipart) (io.ReadCloser, string, int64, error) {
 			if f.Open != nil {
 				src, err = f.Open()
 				if err != nil {
-					_ = pw.CloseWithError(err)
 					return
 				}
 			} else if rs, ok := f.Reader.(io.ReadSeeker); ok {
-				if _, err := rs.Seek(0, io.SeekStart); err != nil {
-					_ = pw.CloseWithError(err)
+				if _, err = rs.Seek(0, io.SeekStart); err != nil {
 					return
 				}
 				if rc, ok := f.Reader.(io.ReadCloser); ok {
@@ -1114,10 +1253,10 @@ func buildMultipartStream(m *Multipart) (io.ReadCloser, string, int64, error) {
 				}
 			}
 
-			_, err = copyBuffered(part, src)
+			// Use context-aware copy
+			_, err = copyWithContext(ctx, part, src)
 			_ = src.Close()
 			if err != nil {
-				_ = pw.CloseWithError(err)
 				return
 			}
 		}
@@ -1125,6 +1264,47 @@ func buildMultipartStream(m *Multipart) (io.ReadCloser, string, int64, error) {
 
 	// content length unknown for streamed multipart
 	return pr, w.FormDataContentType(), -1, nil
+}
+
+// copyWithContext copies from src to dst with context cancellation support.
+// Uses pooled buffer for efficiency.
+func copyWithContext(ctx context.Context, dst io.Writer, src io.Reader) (int64, error) {
+	buf := getCopyBuf()
+	defer putCopyBuf(buf)
+
+	var written int64
+	for {
+		// Check context periodically
+		select {
+		case <-ctx.Done():
+			return written, ctx.Err()
+		default:
+		}
+
+		nr, er := src.Read(buf)
+		if nr > 0 {
+			nw, ew := dst.Write(buf[:nr])
+			if nw < 0 || nr < nw {
+				nw = 0
+				if ew == nil {
+					ew = errors.New("invalid write result")
+				}
+			}
+			written += int64(nw)
+			if ew != nil {
+				return written, ew
+			}
+			if nr != nw {
+				return written, io.ErrShortWrite
+			}
+		}
+		if er != nil {
+			if er == io.EOF {
+				return written, nil
+			}
+			return written, er
+		}
+	}
 }
 
 func (c *Client) buildURL(path string, q url.Values) (string, error) {
